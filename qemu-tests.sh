@@ -512,6 +512,168 @@ t_pool_runtime() {
     dmesg_check "$n" && pass "$n"
 }
 
+# Reads one timeout out of a pool's block in /proc/net/CGNAT/pools. The file
+# lists every pool, so anchor on the pool name and take the timeouts line that
+# follows it rather than the first one in the file.
+tmt_of() {
+    awk -v want="pool $1" -v key="$2" '
+        $0 == want { inpool = 1; next }
+        /^pool /   { inpool = 0 }
+        inpool && /^  timeouts:/ {
+            for (i = 2; i <= NF; i++) {
+                split($i, kv, "=")
+                if (kv[1] == key) { print kv[2]; exit }
+            }
+            exit
+        }' /proc/net/CGNAT/pools
+}
+
+t_timeouts() {
+    local n="per-pool timeouts: parsed, clamped, rounded and reported"
+    dmesg_mark
+    rules_down; mod_down; sleep 0.3
+
+    # `timeouts` sets the baseline; a pool overrides individual keys on top of
+    # it. `two` also mixes key=value with the positional deterministic fields,
+    # which is the case the '=' sniff in the parser exists for.
+    if ! insmod "$MODULE" timeouts="udp_est=120:icmp=20" \
+         nat_pool="one:$POOL_START-$POOL_END:udp_dns=20,two:203.0.113.100-203.0.113.163:udp=40:10.0.0.0/20:1008:tcp_est=600" \
+         2>"$TMPD/err"; then
+        fail "$n" "insmod with timeouts failed: $(head -1 "$TMPD/err")"
+        mod_up 2>/dev/null; rules_up; return
+    fi
+
+    local bad=""
+    # baseline from the module parameter reaches both pools
+    [ "$(tmt_of one udp_est)" = 120 ] || bad="$bad one.udp_est=$(tmt_of one udp_est)!=120;"
+    [ "$(tmt_of two udp_est)" = 120 ] || bad="$bad two.udp_est=$(tmt_of two udp_est)!=120;"
+    [ "$(tmt_of one icmp)"    = 20  ] || bad="$bad one.icmp=$(tmt_of one icmp)!=20;"
+    # per-pool overrides, and they do not leak into the other pool
+    [ "$(tmt_of one udp_dns)" = 20  ] || bad="$bad one.udp_dns=$(tmt_of one udp_dns)!=20;"
+    [ "$(tmt_of two udp_dns)" = 60  ] || bad="$bad two.udp_dns=$(tmt_of two udp_dns)!=60;"
+    [ "$(tmt_of two udp)"     = 40  ] || bad="$bad two.udp=$(tmt_of two udp)!=40;"
+    [ "$(tmt_of two tcp_est)" = 600 ] || bad="$bad two.tcp_est=$(tmt_of two tcp_est)!=600;"
+    [ "$(tmt_of one udp)"     = 30  ] || bad="$bad one.udp=$(tmt_of one udp)!=30;"
+    # the deterministic fields still parsed despite being sandwiched in key=value
+    grep -A3 "^pool two" /proc/net/CGNAT/pools | grep -q "deterministic: 4096 subscribers" \
+        || bad="$bad two-not-deterministic;"
+
+    if [ -n "$bad" ]; then
+        fail "$n" "$bad"
+        mod_down; mod_up; rules_up; return
+    fi
+
+    # A value between two GC steps must round up, not silently behave as the
+    # step below it - and must never leave a session that steps over the
+    # release window, which is what leaked ports before.
+    mod_down; sleep 0.3
+    insmod "$MODULE" nat_pool="r:$POOL_START-$POOL_END:udp_est=45" 2>/dev/null
+    local rounded; rounded=$(tmt_of r udp_est)
+    mod_down; sleep 0.3
+    [ "$rounded" = 50 ] || bad="$bad udp_est=45 became '$rounded', want 50;"
+
+    # malformed specs must be refused rather than accepted or oopsed
+    local spec
+    for spec in "b:$POOL_START-$POOL_END:nosuch=30" \
+                "b:$POOL_START-$POOL_END:udp_est=0" \
+                "b:$POOL_START-$POOL_END:udp_est=99999" \
+                "b:$POOL_START-$POOL_END:udp_est=abc" \
+                "b:$POOL_START-$POOL_END:udp_est="; do
+        if insmod "$MODULE" nat_pool="$spec" 2>/dev/null; then
+            rmmod xt_CGNAT 2>/dev/null
+            bad="$bad accepted '$spec';"
+        fi
+    done
+    # and so must a bad `timeouts` baseline
+    if insmod "$MODULE" nat_pool="$POOL_START-$POOL_END" timeouts="udp_est" 2>/dev/null; then
+        rmmod xt_CGNAT 2>/dev/null
+        bad="$bad accepted timeouts=udp_est;"
+    fi
+
+    mod_up || { fail "$n" "could not reload module"; return; }
+    rules_up
+
+    # runtime add carries timeouts too
+    echo "add rt:203.0.113.200-203.0.113.230:udp_dns=30" > /proc/net/CGNAT/pools 2>/dev/null
+    [ "$(tmt_of rt udp_dns)" = 30 ] || bad="$bad runtime add udp_dns=$(tmt_of rt udp_dns)!=30;"
+    echo "del rt" > /proc/net/CGNAT/pools 2>/dev/null
+
+    if [ -n "$bad" ]; then fail "$n" "$bad"; return; fi
+    dmesg_check "$n" && pass "$n"
+}
+
+t_aging_ports() {
+    # The GC releases a session's port in a window one sweep wide and unlinks it
+    # in the next. That window used to be an exact "timeout == 0" test, which
+    # only ever fired because every timeout in the module was a multiple of the
+    # sweep step - a configurable one that was not would step straight over it,
+    # leaking the port forever and losing the NetFlow close record. Parse time
+    # now rounds and the window is a range, but what is worth asserting is the
+    # consequence rather than either mechanism: ports come back.
+    #
+    # The generator is bounded here (n_ips x ports_per_ip), unlike in t_aging
+    # which deliberately oversubscribes. A fixed 60000 sessions against a single
+    # NAT address's 64512 ports leaves 4512 of headroom, so a leak of more than
+    # 7% of one cycle shows up as an allocation failure on the next - and every
+    # cycle must reach the same count, which a slower leak fails.
+    local n="ports are returned to the pool as sessions age out"
+    local ips=300 per_ip=200 want=60000
+    dmesg_mark
+    rules_down; mod_down; sleep 0.3
+
+    local gen="$TMPD/cps-gen"
+    if [ ! -x "$gen" ] && ! { [ -f "$SRCDIR/cps-gen.c" ] && gcc -O2 -o "$gen" "$SRCDIR/cps-gen.c" 2>/dev/null; }; then
+        skip "$n" "cps-gen unavailable"
+        mod_up; rules_up; return
+    fi
+
+    # udp=30 rather than the minimum: the GC visits a bucket on a schedule that
+    # has nothing to do with when a session in it was created, so a timeout of
+    # one step expires anywhere in 0..10s and a burst spends its time recreating
+    # sessions it just made. Three steps guarantees at least 20s of life, which
+    # is longer than the burst. .3 is unused, so nothing replies and none of
+    # these ever reach udp_est.
+    if ! insmod "$MODULE" nat_pool="p:$POOL_START-$POOL_START:udp=30" 2>"$TMPD/err"; then
+        fail "$n" "insmod failed: $(head -1 "$TMPD/err")"
+        mod_up 2>/dev/null; rules_up; return
+    fi
+    POOL_OPT="--pool p" rules_up
+
+    local dmac; dmac=$(ip link show xn-s0 | awk '/link\/ether/{print $2}')
+    local cycle peak bad="" i act
+    for cycle in 1 2 3 4 5; do
+        ip netns exec $NS_SUB "$gen" xn-s1 "$dmac" "$SUB_NET.10" $ips "$INET_NET.3" 3 $per_ip \
+            >/dev/null 2>&1
+        sleep 2
+        peak=$(nat_stat "Active NAT sessions")
+        info "cycle $cycle: $peak of $want sessions (created $(nat_stat "Created NAT sessions"), raced $(nat_stat "Raced session creates"), noport $(nat_stat "Failed sessions no free port"), ulimit $(nat_stat "Failed sessions user limit"))"
+        # Bounded on both sides. Low means ports did not come back; high means
+        # sessions were created for a tuple that already had one, which is what
+        # happens when a session ages out from under a burst that is still
+        # sending to it. 2% either way for packets the virtio path drops.
+        [ "${peak:-0}" -ge $(( want * 98 / 100 )) ] \
+            || bad="$bad cycle$cycle reached only ${peak:-0} of $want;"
+        [ "${peak:-0}" -le $(( want * 102 / 100 )) ] \
+            || bad="$bad cycle$cycle reached ${peak:-0}, above $want;"
+
+        for i in $(seq 1 24); do
+            sleep 5
+            act=$(nat_stat "Active NAT sessions")
+            [ "${act:-1}" = 0 ] && break
+        done
+        [ "${act:-1}" = 0 ] || bad="$bad cycle$cycle left $act active;"
+    done
+
+    # With 4512 ports of headroom and a table that drains to empty between
+    # cycles, this can only be non-zero if ports were not given back.
+    local noport; noport=$(nat_stat "Failed sessions no free port")
+    [ "${noport:-1}" = 0 ] || bad="$bad noport=$noport after 5 cycles;"
+
+    POOL_OPT="--pool p" rules_down; mod_down; mod_up; rules_up
+    if [ -n "$bad" ]; then fail "$n" "$bad"; return; fi
+    dmesg_check "$n" && pass "$n" && info "5 fill/drain cycles of $want, no ports lost"
+}
+
 t_target_validation() {
     local n="rule without --snat/--dnat is rejected"
     dmesg_mark
@@ -745,6 +907,7 @@ t_icmp_malformed
 t_target_validation
 t_named_pools
 t_pool_runtime
+t_timeouts
 t_capture
 t_bad_params
 t_reload_cycles
@@ -752,8 +915,10 @@ t_rmmod_under_load
 
 if [ $SOAK = 1 ]; then
     t_aging
+    t_aging_ports
 else
     skip "sessions age out and the tables drain" "use --soak"
+    skip "ports are returned to the pool as sessions age out" "use --soak"
 fi
 
 srv_stop

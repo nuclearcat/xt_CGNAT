@@ -93,9 +93,14 @@ net_down() {
 # than flushing. Never touch the chain policies. If this ever runs somewhere
 # it should not, it must not take the host's firewall with it.
 rules_up() {
+    # -I 1 each time, so these end up in the reverse of the order written: the
+    # two notrack rules first, then the DNAT. That order matters. CT --notrack
+    # returns XT_CONTINUE and falls through, but CGNAT returns NF_ACCEPT and
+    # ends the table - put the DNAT first and the -d $POOL_NET notrack below it
+    # is unreachable, and every inbound flow gets a conntrack entry.
+    ipt -t raw -I PREROUTING 1 -d $POOL_NET -j CGNAT --dnat ${POOL_OPT:-}
     ipt -t raw -I PREROUTING 1 -s $SUB_CIDR -j CT --notrack
     ipt -t raw -I PREROUTING 1 -d $POOL_NET -j CT --notrack
-    ipt -t raw -I PREROUTING 1 -d $POOL_NET -j CGNAT --dnat ${POOL_OPT:-}
     # return direction is DNATed in raw, then traverses FORWARD normally
     ipt -I FORWARD 1 -i xn-i0 -o xn-s0 -d $SUB_CIDR -j ACCEPT
     # the NAT target is terminating for what it accepts, so it goes first
@@ -105,9 +110,9 @@ rules_up() {
 rules_down() {
     ipt -D FORWARD -s $SUB_CIDR -o xn-i0 -j CGNAT --snat ${POOL_OPT:-} 2>/dev/null
     ipt -D FORWARD -i xn-i0 -o xn-s0 -d $SUB_CIDR -j ACCEPT 2>/dev/null
-    ipt -t raw -D PREROUTING -d $POOL_NET -j CGNAT --dnat ${POOL_OPT:-} 2>/dev/null
     ipt -t raw -D PREROUTING -d $POOL_NET -j CT --notrack 2>/dev/null
     ipt -t raw -D PREROUTING -s $SUB_CIDR -j CT --notrack 2>/dev/null
+    ipt -t raw -D PREROUTING -d $POOL_NET -j CGNAT --dnat ${POOL_OPT:-} 2>/dev/null
     return 0
 }
 

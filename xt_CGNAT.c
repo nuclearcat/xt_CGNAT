@@ -14,6 +14,7 @@
 #include <linux/proc_fs.h>
 #include <linux/percpu.h>
 #include <linux/bitmap.h>
+#include <linux/jump_label.h>
 #include <linux/mm.h>
 #include <net/tcp.h>
 #include "compat.h"
@@ -32,6 +33,25 @@
 #define FLAG_POOL_BITS  3
 #define CGNAT_MAX_POOLS (1 << FLAG_POOL_BITS)
 #define FLAG_POOL_MASK  ((CGNAT_MAX_POOLS - 1) << FLAG_POOL_SHIFT)
+
+/* Classified once, at creation, from the destination port - not re-derived per
+ * packet. The datapath already has this byte in hand for the FLAG_REPLIED test
+ * and already stores to timeout on the same cacheline, so selecting a second
+ * timeout off it costs an AND and a predictable branch, and no extra memory
+ * traffic. Deriving it per packet would mean reading udp->dest on the SNAT side
+ * and udp->source on the DNAT side, which is both more work and easy to invert.
+ *
+ * Bit 7 is the last one free.
+ */
+#define FLAG_SHORTLIVED (1 << 6) /* 1000000 - DNS-class UDP, uses tmt.udp_dns */
+
+/* The GC decrements every session by this many seconds per full sweep, and the
+ * release and unlink windows in sessions_cleanup_timer_callback() are each
+ * exactly one step wide. Timeouts are rounded to a multiple of it at parse
+ * time so a session cannot step over a window.
+ */
+#define NAT_GC_STEP 10
+#define NAT_TMT_MAX 32760       /* fits int16_t timeout, and is a whole number of steps */
 
 #define TCP_SYN_ACK 0x12
 #define TCP_FIN_RST 0x05
@@ -105,10 +125,12 @@ static char *nat_pool = nat_pool_buf;
 module_param(nat_pool, charp, 0444);
 MODULE_PARM_DESC(nat_pool,
     "one or more pools, comma separated: [<name>:]<start>-<end>"
-    "[:<subscriber_cidr>:<ports_per_subscriber>]. Without a name there is one "
-    "pool called 'default'; -j CGNAT --pool <name> selects among several. The "
-    "trailing two fields turn on deterministic RFC 7422 mapping, e.g. "
-    "acme:198.51.100.1-198.51.100.8:10.0.0.0/20:1008");
+    "[:<subscriber_cidr>:<ports_per_subscriber>][:<key>=<seconds>...]. Without "
+    "a name there is one pool called 'default'; -j CGNAT --pool <name> selects "
+    "among several. The two bare trailing fields turn on deterministic RFC 7422 "
+    "mapping, e.g. acme:198.51.100.1-198.51.100.8:10.0.0.0/20:1008. Any field "
+    "containing '=' is a timeout override for this pool - see the `timeouts` "
+    "parameter for the keys, e.g. res:100.64.0.1-100.64.0.8:udp_dns=20");
 
 static int nat_hash_size = 256 * 1024;
 module_param(nat_hash_size, int, 0444);
@@ -157,6 +179,15 @@ static char *nf_dest = nf_dest_buf;
 module_param(nf_dest, charp, 0444);
 MODULE_PARM_DESC(nf_dest, "Netflow v9 collectors (addr1:port1[,addr2:port2]), default = none");
 
+static char timeouts_buf[256] = "";
+static char *timeouts = timeouts_buf;
+module_param(timeouts, charp, 0444);
+MODULE_PARM_DESC(timeouts,
+    "default session timeouts in seconds, colon separated <key>=<value>: "
+    "tcp, tcp_est, tcp_fin, udp, udp_est, udp_dns, icmp, other, other_est. "
+    "Rounded up to a multiple of 10. A pool overrides any of these with the "
+    "same syntax in its own spec; this only sets what pools start from.");
+
 u_int32_t nat_htable_vector = 0;
 u_int32_t users_htable_vector = 0;
 
@@ -198,7 +229,88 @@ struct nat_pool_stats {
     s64 active;
 };
 
+/* Seconds, all of them, and all a multiple of NAT_GC_STEP. The *_est values
+ * apply once FLAG_REPLIED is set - for UDP that is "a reply came back", not a
+ * connection state, which is why the field is not called "established".
+ *
+ * udp_dns exists because a DNS transaction is one query and one reply, and the
+ * mapping is dead the moment the reply lands - but every stub resolver
+ * randomises its source port per query (RFC 5452), so each query burns a
+ * distinct mapping. Holding those for udp_est caps a NAT address at
+ * (64512 / udp_est) new DNS transactions per second no matter how little
+ * traffic they carry.
+ */
+struct nat_timeouts {
+    uint16_t tcp;                       /* SYN out, nothing back yet */
+    uint16_t tcp_est;
+    uint16_t tcp_fin;                   /* FIN or RST seen either way */
+    uint16_t udp;                       /* nothing back yet */
+    uint16_t udp_est;
+    uint16_t udp_dns;                   /* replied, destination was port 53 */
+    uint16_t icmp;
+    uint16_t other;                     /* protocols with no port to allocate */
+    uint16_t other_est;
+};
+
+/* What the timeouts were before they were configurable, so an existing
+ * deployment that sets nothing keeps its behaviour - with the one deliberate
+ * exception of udp_dns, which did not exist and effectively was udp_est.
+ *
+ * Macros rather than only a struct because the packet path uses them as
+ * immediates on the default path (see NAT_TMT below); the struct is built from
+ * the same macros so there is one source of truth for the values.
+ */
+#define TMT_TCP        30
+#define TMT_TCP_EST   300
+#define TMT_TCP_FIN    10
+#define TMT_UDP        30
+#define TMT_UDP_EST   300
+#define TMT_UDP_DNS    60
+#define TMT_ICMP       30
+#define TMT_OTHER      30
+#define TMT_OTHER_EST 300
+
+static const struct nat_timeouts nat_tmt_builtin = {
+    .tcp   = TMT_TCP,   .tcp_est   = TMT_TCP_EST, .tcp_fin = TMT_TCP_FIN,
+    .udp   = TMT_UDP,   .udp_est   = TMT_UDP_EST, .udp_dns = TMT_UDP_DNS,
+    .icmp  = TMT_ICMP,
+    .other = TMT_OTHER, .other_est = TMT_OTHER_EST,
+};
+
+/* Off until some pool actually differs from the built-in schedule. While it is
+ * off, static_branch_unlikely() is a patched-out nop: the packet path does not
+ * read the pool, does not touch that cacheline, and the timeout it stores is an
+ * immediate - exactly the code that was there before pools had timeouts. The
+ * cost of the feature is paid only by deployments that use it.
+ *
+ * One-way. pool_del() of the last customised pool leaves it on rather than
+ * re-scanning and disabling: flipping it back while packets are in flight buys
+ * nothing measurable and the reload path is the honest way to get back to a
+ * clean default.
+ */
+static DEFINE_STATIC_KEY_FALSE(nat_custom_tmt);
+
+/* Session timeout for one event, from the session's own pool - the pool its
+ * port came from, which is not necessarily the pool named by whichever rule
+ * this packet traversed. sess->flags is already in hand at every call site for
+ * the FLAG_REPLIED test, so the pool index costs nothing to recover.
+ */
+#define NAT_TMT(sess, field, builtin)                                       \
+    (static_branch_unlikely(&nat_custom_tmt)                                \
+        ? pool_of(sess)->tmt.field : (uint16_t)(builtin))
+
+/* Seeded from the `timeouts` module parameter, then copied into each pool as
+ * its starting point before that pool's own key=value fields are applied.
+ */
+static struct nat_timeouts nat_tmt_default;
+
 struct nat_pool {
+    /* First, and read on the established packet path - one line, shared by
+     * every packet through this pool, so it stays resident. Everything below
+     * is touched only on session creation or from /proc.
+     */
+    struct nat_timeouts tmt;
+
     bool used;                          /* slot occupied */
     atomic_t refcnt;                    /* iptables rules pointing here */
     char name[XT_CGNAT_POOL_NAMELEN];
@@ -1059,10 +1171,27 @@ static struct nat_session *create_nat_session(struct nat_pool *pool, const uint8
     sess->out_port   = natport;
     sess->u.dst.addr = dstaddr;
     sess->u.dst.port = dstport;
-    sess->timeout    = 30;
     sess->proto      = proto;
     sess->flags      = (READ_ONCE(port_quarantine) ? FLAG_QUARANTINE : 0)
                        | ((unsigned)(pool - nat_pools) << FLAG_POOL_SHIFT);
+
+    /* Nothing has replied yet, so this is the unreplied timeout for the
+     * protocol. Read from the pool unconditionally: session creation already
+     * costs a port search and two locked hash inserts, so one more field off a
+     * struct that is about to be touched anyway does not need the static key.
+     */
+    switch (proto) {
+    case IPPROTO_TCP:  sess->timeout = pool->tmt.tcp;  break;
+    case IPPROTO_UDP:  sess->timeout = pool->tmt.udp;  break;
+    case IPPROTO_ICMP: sess->timeout = pool->tmt.icmp; break;
+    default:           sess->timeout = pool->tmt.other; break;
+    }
+
+    /* Only UDP: 53/tcp is a zone transfer or a truncated-response retry, both
+     * of which are ordinary connections that deserve the ordinary timeout.
+     */
+    if (proto == IPPROTO_UDP && dstport == htons(53))
+        sess->flags |= FLAG_SHORTLIVED;
 
     hash = get_hash_nat_ent(proto, useraddr, userport);
     spin_lock_bh(&ht_inner[hash].lock);
@@ -1149,15 +1278,15 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 tcp->source = session->out_port;
 
                 if (tcp->fin || tcp->rst) {
-                    session->timeout=10;
+                    session->timeout = NAT_TMT(session, tcp_fin, TMT_TCP_FIN);
                     session->flags |= FLAG_TCP_FIN;
                 } else if (session->flags & FLAG_TCP_FIN) {
-                    session->timeout=10;
+                    session->timeout = NAT_TMT(session, tcp_fin, TMT_TCP_FIN);
                     session->flags &= ~FLAG_TCP_FIN;
                 } else if ((session->flags & FLAG_REPLIED) == 0) {
-                    session->timeout=30;
+                    session->timeout = NAT_TMT(session, tcp, TMT_TCP);
                 } else {
-                    session->timeout=300;
+                    session->timeout = NAT_TMT(session, tcp_est, TMT_TCP_EST);
                 }
 
                 rcu_read_unlock_bh();
@@ -1203,9 +1332,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 ip->saddr = session->nat_addr;
                 udp->source = session->out_port;
                 if ((session->flags & FLAG_REPLIED) == 0) {
-                    session->timeout=30;
+                    session->timeout = NAT_TMT(session, udp, TMT_UDP);
+                } else if (session->flags & FLAG_SHORTLIVED) {
+                    session->timeout = NAT_TMT(session, udp_dns, TMT_UDP_DNS);
                 } else {
-                    session->timeout=300;
+                    session->timeout = NAT_TMT(session, udp_est, TMT_UDP_EST);
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1254,7 +1385,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->out_port, true);
                     icmp->un.echo.id = session->out_port;
                 }
-                session->timeout=30;
+                session->timeout = NAT_TMT(session, icmp, TMT_ICMP);
                 rcu_read_unlock_bh();
             } else {
                 rcu_read_unlock_bh();
@@ -1284,9 +1415,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 csum_replace4(&ip->check, ip->saddr, session->nat_addr);
                 ip->saddr = session->nat_addr;
                 if ((session->flags & FLAG_REPLIED) == 0) {
-                    session->timeout=30;
+                    session->timeout = NAT_TMT(session, other, TMT_OTHER);
                 } else {
-                    session->timeout=300;
+                    session->timeout = NAT_TMT(session, other_est, TMT_OTHER_EST);
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1328,13 +1459,13 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 ip->daddr = session->in_addr;
                 tcp->dest = session->in_port;
                 if (tcp->fin || tcp->rst) {
-                    session->timeout=10;
+                    session->timeout = NAT_TMT(session, tcp_fin, TMT_TCP_FIN);
                     session->flags |= FLAG_TCP_FIN;
                 } else if (session->flags & FLAG_TCP_FIN) {
-                    session->timeout=10;
+                    session->timeout = NAT_TMT(session, tcp_fin, TMT_TCP_FIN);
                     session->flags &= ~FLAG_TCP_FIN;
                 } else if ((session->flags & FLAG_REPLIED) == 0) {
-                    session->timeout=300;
+                    session->timeout = NAT_TMT(session, tcp_est, TMT_TCP_EST);
                     session->flags |= FLAG_REPLIED;
                 }
                 rcu_read_unlock_bh();
@@ -1371,7 +1502,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 udp->dest = session->in_port;
 
                 if ((session->flags & FLAG_REPLIED) == 0) {
-                    session->timeout=300;
+                    session->timeout = (session->flags & FLAG_SHORTLIVED)
+                                     ? NAT_TMT(session, udp_dns, TMT_UDP_DNS)
+                                     : NAT_TMT(session, udp_est, TMT_UDP_EST);
                     session->flags |= FLAG_REPLIED;
                 }
                 rcu_read_unlock_bh();
@@ -1536,7 +1669,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     icmp->un.echo.id = session->in_port;
                 }
                 if ((session->flags & FLAG_REPLIED) == 0) {
-                    session->timeout=30;
+                    session->timeout = NAT_TMT(session, icmp, TMT_ICMP);
                     session->flags |= FLAG_REPLIED;
                 }
                 rcu_read_unlock_bh();
@@ -1558,7 +1691,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 csum_replace4(&ip->check, ip->daddr, session->in_addr);
                 ip->daddr = session->in_addr;
                 if ((session->flags & FLAG_REPLIED) == 0) {
-                    session->timeout=300;
+                    session->timeout = NAT_TMT(session, other_est, TMT_OTHER_EST);
                     session->flags |= FLAG_REPLIED;
                 }
                 rcu_read_unlock_bh();
@@ -1655,8 +1788,18 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
         spin_lock_bh(&ht_inner[i].lock);
         if (ht_inner[i].use > 0) {
             hlist_for_each_entry_safe(sess, next, &ht_inner[i].session, inner_node) {
-                sess->timeout -= 10;
-                if (sess->timeout == 0) {
+                sess->timeout -= NAT_GC_STEP;
+                /* One step wide, so exactly one sweep lands in it for any
+                 * starting value. The old test was == 0, which only ever fired
+                 * because every timeout assigned was a multiple of the step:
+                 * anything else skipped straight past it to the unlink branch,
+                 * leaking the port and losing the session-close record. Now
+                 * that timeouts are configurable that is no longer a property
+                 * of the code, so do not depend on it here either - parse time
+                 * rounds to a step as well, and this survives if it ever
+                 * stops.
+                 */
+                if (sess->timeout <= 0 && sess->timeout > -NAT_GC_STEP) {
                     /* last read of u.dst: the union becomes an rcu_head below */
                     netflow_export_flow_v9(sess->proto, sess->in_addr, sess->in_port,
                                            sess->u.dst.addr, sess->u.dst.port,
@@ -1671,7 +1814,7 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
                      */
                     if (!(sess->flags & FLAG_QUARANTINE))
                         nat_release_port(sess);
-                } else if (sess->timeout <= -10) {
+                } else if (sess->timeout <= -NAT_GC_STEP) {
                     if (sess->flags & FLAG_QUARANTINE)
                         nat_release_port(sess);
                     proto = sess->proto;
@@ -1838,12 +1981,17 @@ static int pools_seq_show(struct seq_file *m, void *v)
     struct nat_pool *p;
     int i;
 
-    seq_printf(m, "# write \"add [<name>:]<start>-<end>[:<cidr>:<ports>]\" or \"del <name>\"\n");
+    seq_printf(m, "# write \"add [<name>:]<start>-<end>[:<cidr>:<ports>][:<key>=<sec>...]\" or \"del <name>\"\n");
     for_each_pool(i, p) {
         seq_printf(m, "pool %s\n", p->name);
         seq_printf(m, "  range: %pI4-%pI4 (%u addresses, %u ports each)\n",
                    &p->start, &p->end, p->size,
                    NAT_PORT_BITS - NAT_PORT_LO);
+        seq_printf(m, "  timeouts: tcp=%u tcp_est=%u tcp_fin=%u udp=%u udp_est=%u "
+                      "udp_dns=%u icmp=%u other=%u other_est=%u\n",
+                   p->tmt.tcp, p->tmt.tcp_est, p->tmt.tcp_fin,
+                   p->tmt.udp, p->tmt.udp_est, p->tmt.udp_dns,
+                   p->tmt.icmp, p->tmt.other, p->tmt.other_est);
         if (pool_det_enabled(p))
             seq_printf(m, "  deterministic: %u subscribers, %u ports each, %u per address\n",
                        p->det_count, p->det_ports, p->det_per_addr);
@@ -1876,7 +2024,7 @@ static int pool_del(const char *name);
 static ssize_t pools_proc_write(struct file *file, const char __user *ubuf,
                                 size_t count, loff_t *ppos)
 {
-    char buf[160], *line, *verb, *rest;
+    char buf[512], *line, *verb, *rest;
     int ret;
 
     if (!capable(CAP_NET_ADMIN))
@@ -2071,6 +2219,88 @@ static struct xt_target nat_tg_reg __read_mostly = {
     .me       = THIS_MODULE,
 };
 
+/* One "<key>=<value>" timeout field, shared by the `timeouts` module parameter
+ * and by the per-pool overrides so the two can never drift.
+ *
+ * Returns 0 if the token was consumed, -ENOENT if it is not a key=value at all
+ * (the caller decides what a bare token means in its context), or -EINVAL if
+ * the key is unknown or the value unusable.
+ */
+static int nat_tmt_parse_kv(char *tok, struct nat_timeouts *t, const char *who)
+{
+    static const struct { const char *key; unsigned short off; } map[] = {
+        { "tcp",       offsetof(struct nat_timeouts, tcp)       },
+        { "tcp_est",   offsetof(struct nat_timeouts, tcp_est)   },
+        { "tcp_fin",   offsetof(struct nat_timeouts, tcp_fin)   },
+        { "udp",       offsetof(struct nat_timeouts, udp)       },
+        { "udp_est",   offsetof(struct nat_timeouts, udp_est)   },
+        { "udp_dns",   offsetof(struct nat_timeouts, udp_dns)   },
+        { "icmp",      offsetof(struct nat_timeouts, icmp)      },
+        { "other",     offsetof(struct nat_timeouts, other)     },
+        { "other_est", offsetof(struct nat_timeouts, other_est) },
+    };
+    unsigned int v;
+    char *val;
+    int i;
+
+    val = strchr(tok, '=');
+    if (!val)
+        return -ENOENT;
+    *val++ = '\0';
+
+    for (i = 0; i < ARRAY_SIZE(map); i++) {
+        if (strcmp(tok, map[i].key))
+            continue;
+        if (kstrtouint(val, 10, &v) || v < NAT_GC_STEP || v > NAT_TMT_MAX) {
+            printk(KERN_ERR "xt_CGNAT: %s: %s must be %u..%u seconds\n",
+                   who, map[i].key, NAT_GC_STEP, NAT_TMT_MAX);
+            return -EINVAL;
+        }
+        /* Rounded up rather than rejected: the GC only ever sees a session on a
+         * step boundary, so a value between two steps behaves as the lower one
+         * and the configuration would quietly not mean what it says.
+         */
+        v = roundup(v, NAT_GC_STEP);
+        *(uint16_t *)((char *)t + map[i].off) = v;
+        return 0;
+    }
+
+    printk(KERN_ERR "xt_CGNAT: %s: unknown timeout '%s'\n", who, tok);
+    return -EINVAL;
+}
+
+/* The `timeouts` parameter: the same colon separated key=value fields a pool
+ * takes, setting what every pool starts from. */
+static int __init nat_tmt_parse_defaults(void)
+{
+    char *buf, *p, *tok;
+    int ret = 0;
+
+    nat_tmt_default = nat_tmt_builtin;
+    if (!timeouts || !*timeouts)
+        return 0;
+
+    buf = kstrdup(timeouts, GFP_KERNEL);
+    if (!buf)
+        return -ENOMEM;
+
+    p = buf;
+    while ((tok = strsep(&p, ":")) != NULL) {
+        if (!*tok)
+            continue;
+        ret = nat_tmt_parse_kv(tok, &nat_tmt_default, "timeouts");
+        if (ret == -ENOENT) {
+            printk(KERN_ERR "xt_CGNAT: timeouts: '%s' is not <key>=<value>\n", tok);
+            ret = -EINVAL;
+        }
+        if (ret < 0)
+            break;
+    }
+
+    kfree(buf);
+    return ret;
+}
+
 /* nat_pool defines one or more pools, separated by commas:
  *
  *   <start>-<end>[:<sub_cidr>:<ports>]                    the single unnamed pool
@@ -2082,9 +2312,10 @@ static struct xt_target nat_tg_reg __read_mostly = {
  */
 static int nat_pool_parse_one(char *spec, struct nat_pool *pool)
 {
-    char *p = spec, *first, *range, *sub, *portstr, *sep;
+    char *p = spec, *first, *range, *sub = NULL, *portstr = NULL, *tok, *sep;
     unsigned int ports, need, per_addr, prefix;
     u_int32_t subnet;
+    int ret;
 
     first = strsep(&p, ":");
     if (first && strchr(first, '-')) {           /* unnamed: <start>-<end>... */
@@ -2098,9 +2329,6 @@ static int nat_pool_parse_one(char *spec, struct nat_pool *pool)
         strscpy(pool->name, first, sizeof(pool->name));
         range = strsep(&p, ":");
     }
-    sub     = strsep(&p, ":");
-    portstr = strsep(&p, ":");
-
     sep = range ? strchr(range, '-') : NULL;
     if (!sep) {
         printk(KERN_ERR "xt_CGNAT: pool '%s' needs <start>-<end>\n", pool->name);
@@ -2115,6 +2343,32 @@ static int nat_pool_parse_one(char *spec, struct nat_pool *pool)
         return -EINVAL;
     }
     pool->size = get_pool_size(pool);
+
+    /* What is left is the two optional deterministic fields, which are
+     * positional and must stay that way for the old syntax to keep working,
+     * plus any number of <key>=<value> timeout overrides, which are not.
+     * Telling them apart on the '=' is what lets the two mix in either order:
+     * without it "acme:1.1.1.1-1.1.1.8:udp=30" would take the timeout for the
+     * subscriber CIDR and fail asking for a ports-per-subscriber count.
+     */
+    while ((tok = strsep(&p, ":")) != NULL) {
+        if (!*tok)
+            continue;
+        ret = nat_tmt_parse_kv(tok, &pool->tmt, pool->name);
+        if (ret == 0)
+            continue;
+        if (ret != -ENOENT)
+            return ret;
+        if (!sub)
+            sub = tok;
+        else if (!portstr)
+            portstr = tok;
+        else {
+            printk(KERN_ERR "xt_CGNAT: pool '%s': unexpected field '%s'\n",
+                   pool->name, tok);
+            return -EINVAL;
+        }
+    }
 
     if (!sub && !portstr)                        /* shared ports, as before */
         return 0;
@@ -2194,11 +2448,27 @@ static int pool_conflicts(const struct nat_pool *cand)
 /* Runtime add. Caller holds nat_pools_mutex. The slot is only marked used once
  * it is fully built, and nothing can reach it before that: the packet path
  * needs a rule, and a rule needs checkentry to find it by name. */
+/* Arm the packet path's pool lookup the first time a pool wants something other
+ * than the built-in schedule. Process context under nat_pools_mutex, which is
+ * where static_branch_enable() has to be called from - it patches text and
+ * takes cpus_read_lock().
+ */
+static void nat_tmt_arm(const struct nat_pool *pool)
+{
+    if (memcmp(&pool->tmt, &nat_tmt_builtin, sizeof(pool->tmt)) &&
+        !static_key_enabled(&nat_custom_tmt.key)) {
+        static_branch_enable(&nat_custom_tmt);
+        printk(KERN_INFO "xt_CGNAT: pool '%s' overrides the default timeouts; "
+                         "the packet path now reads them per session\n", pool->name);
+    }
+}
+
 static int pool_add(char *spec)
 {
     struct nat_pool tmp = {}, *slot = NULL;
     int i, ret;
 
+    tmp.tmt = nat_tmt_default;
     ret = nat_pool_parse_one(spec, &tmp);
     if (ret < 0)
         return ret;
@@ -2221,6 +2491,7 @@ static int pool_add(char *spec)
         return ret;
     }
     slot->used = true;
+    nat_tmt_arm(slot);
     return 0;
 }
 
@@ -2257,14 +2528,17 @@ static int pool_del(const char *name)
 
 static int __init nat_pool_parse(void)
 {
-    char buf[256], *p, *spec;
+    char *buf, *p, *spec;
     struct nat_pool *slot;
-    int n = 0, ret;
+    int n = 0, ret = 0;
 
-    if (strscpy(buf, nat_pool, sizeof(buf)) < 0) {
-        printk(KERN_ERR "xt_CGNAT: nat_pool string too long\n");
-        return -EINVAL;
-    }
+    /* Copied rather than parsed in place because strsep() writes to it, and
+     * kstrdup'd rather than into a fixed buffer because eight pools each
+     * carrying timeout overrides runs well past any reasonable stack array.
+     */
+    buf = kstrdup(nat_pool, GFP_KERNEL);
+    if (!buf)
+        return -ENOMEM;
 
     p = buf;
     while ((spec = strsep(&p, ",")) != NULL) {
@@ -2272,23 +2546,30 @@ static int __init nat_pool_parse(void)
             continue;
         if (n >= CGNAT_MAX_POOLS) {
             printk(KERN_ERR "xt_CGNAT: at most %d pools\n", CGNAT_MAX_POOLS);
-            return -EINVAL;
+            ret = -EINVAL;
+            goto out;
         }
         slot = &nat_pools[n];
+        slot->tmt = nat_tmt_default;
         ret = nat_pool_parse_one(spec, slot);
         if (ret < 0)
-            return ret;
+            goto out;
         slot->used = true;              /* tables are built later by pools_create() */
         atomic_set(&slot->refcnt, 0);
-        if (pool_conflicts(slot) < 0)
-            return -EINVAL;
+        if (pool_conflicts(slot) < 0) {
+            ret = -EINVAL;
+            goto out;
+        }
+        nat_tmt_arm(slot);
         n++;
     }
     if (n == 0) {
         printk(KERN_ERR "xt_CGNAT: nat_pool defines no pools\n");
-        return -EINVAL;
+        ret = -EINVAL;
     }
-    return 0;
+out:
+    kfree(buf);
+    return ret;
 }
 
 static int __init nat_tg_init(void)
@@ -2317,6 +2598,10 @@ static int __init nat_tg_init(void)
     templateV9.n_port_len	= htons(2);
     templateV9.s_type_id	= htons(230);
     templateV9.s_type_len	= htons(1);
+
+    /* before nat_pool_parse(): every pool starts from these */
+    if (nat_tmt_parse_defaults() < 0)
+        return -EINVAL;
 
     if (nat_pool_parse() < 0)
         return -EINVAL;

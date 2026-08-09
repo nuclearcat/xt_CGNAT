@@ -90,6 +90,21 @@ The suite also covers named pools and runtime pool management - adding a pool
 through `/proc/net/CGNAT/pools`, refusing an overlapping range, a duplicate
 name, and a delete while a rule or a session still references it.
 
+Timeouts are covered twice. The functional test checks the parser: the
+`timeouts` baseline reaching every pool, per-pool overrides on top of it that do
+not leak into the next pool, `key=value` mixed in among the positional
+deterministic fields, rounding up to a whole GC step, and refusal of unknown
+keys and out-of-range values.
+
+Under `--soak`, `t_aging_ports` checks the consequence that matters - that a
+port comes back when its session ages out. It drives exactly 60000 bounded
+tuples at a single NAT address's 64512 ports, five times, waiting for the table
+to drain to empty between each. Every cycle must reach the same count and
+`noport` must stay at zero; 4512 ports of headroom means a leak of more than 7%
+of one cycle fails the next. Verified against a deliberately broken build that
+leaked one port in eight, which fails at cycle 2 - a test for a leak that has
+never been shown to fail on a leak is not evidence of anything.
+
 `--pool-sweep` runs 1, 2, 4, 8, 16 NAT addresses. It was written when
 `create_session_lock[]` — one spinlock per NAT address — was the constraint. It
 no longer is, so the sweep now mostly measures *pool capacity*: with the bitmap

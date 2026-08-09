@@ -122,3 +122,72 @@ Considered alongside NetFlow v9. The template mechanism is close enough that
 much of the v9 path would be reused, and IEs 225/227/230 carry over. Worth doing
 if a collector in the deployment path needs it; not otherwise, since v9 already
 carries the NAT event data and export was measured at −0.2% (free).
+
+## Rules
+
+### 10. `--notrack` on the target, so one rule does both
+
+Today each direction needs a `-j CGNAT` rule and a separate `-j CT --notrack`
+rule. They cannot be merged in a ruleset — one rule has one target — and the
+documented order makes one of them dead:
+
+```
+raw/PREROUTING
+1  -d <pool net>   -j CGNAT --dnat     <- returns NF_ACCEPT, ends raw traversal
+2  -d <pool net>   -j CT --notrack     <- unreachable, identical match
+3  -s <subscriber> -j CT --notrack     <- reachable, nothing above matches it
+```
+
+`nat_tg()` returns `NF_ACCEPT` on every path, which terminates `ipt_do_table`
+for the table, so rule 2 never runs. Inbound packets are conntracked today —
+every return flow allocates an entry, which is the exhaustion rules 2 and 3
+exist to prevent. `README.md` and `testnet.sh` both produce this order.
+
+**Fix that first, independently of the rest of this item**: `xt_CT` returns
+`XT_CONTINUE`, so moving the notrack rules above the CGNAT rule works with no
+code change.
+
+The merge itself needs a flag on the target, doing what `xt_CT` does before the
+final `return NF_ACCEPT`:
+
+```c
+if ((info->flags & XT_CGNAT_NOTRACK) && !skb_nfct(skb))
+        nf_ct_set(skb, NULL, IP_CT_UNTRACKED);
+```
+
+Pre-4.12 has no `nf_ct_set()` and needs the `nf_ct_untracked_get()` form in a
+`compat.h` shim; the tested floor is 3.18, so that shim is required, not
+optional. `checkentry` must reject the flag outside table `raw` and outside
+`PRE_ROUTING`/`OUTPUT` — the conntrack hook runs at priority −200, so setting
+`_nfct` after it does nothing and would fail silently.
+
+**Both directions in `raw`.** No kernel change beyond the above: `.hooks`
+already includes `NF_INET_PRE_ROUTING` and `nat_tg()` is hook-agnostic, so
+`-j CGNAT --snat` is accepted there now. What stops it being the recommendation
+is the environment, and all four points are silent failures:
+
+- no `-o` match, so scoping falls to `-i <downlink>`, which also catches
+  locally-destined and subscriber↔subscriber traffic — both get SNATed
+- strict `rp_filter` validates the *rewritten* source against the input
+  interface at routing time, after PREROUTING; a pool address arriving on the
+  downlink fails. Needs `rp_filter=0` there
+- source-based policy routing (`ip rule from ...`) sees the translated address
+- the FORWARD rule doubles as the ACCEPT for that path; move it out and a
+  DROP policy needs an explicit rule
+
+Also: with both rules in one chain, hairpin traffic (subscriber → pool address)
+matches both, and since the target is terminating, rule order picks which
+translation it gets. Today the `--dnat` rule wins by construction.
+
+**Keeping the old form working.** `--notrack` is additive; omit it and the
+packet path is byte-for-byte what it is now, so existing rulesets need no
+change. The wire format is the question:
+
+| approach | cost |
+|---|---|
+| `uint8_t flags` in the existing padding (offset 17; `sizeof` stays 32, `usersize` stays 24) | no revision bump, old userspace zeroes it → old behaviour. But **new** userspace against an **old** module sets a bit nothing reads: notrack silently does not happen |
+| register revisions 0 and 1, emit 1 only when `--notrack` is given | old module rejects revision 1 and `iptables` says so. One extra `xt_target` and one extra `xtables_target` |
+
+Take the second. The first fails in the direction that matters — a box that
+looks configured and is quietly filling its conntrack table — and the padding
+trick saves nothing that a second registration costs.
