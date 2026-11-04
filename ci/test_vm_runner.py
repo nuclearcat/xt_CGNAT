@@ -18,7 +18,7 @@ class VMRunnerTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.src = self.root / "src"
         self.src.mkdir()
-        for name in ("run-vm.sh", "Makefile", "qemu-tests.sh", "testnet.sh", "bench-cps.sh"):
+        for name in ("run-vm.sh", "Makefile", "qemu-tests.sh", "safety-tests.py", "testnet.sh", "bench-cps.sh"):
             shutil.copy(ROOT / name, self.src / name)
         for path in [*ROOT.glob("*.c"), *ROOT.glob("*.h")]:
             shutil.copy(path, self.src / path.name)

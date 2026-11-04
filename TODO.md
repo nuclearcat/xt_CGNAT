@@ -4,6 +4,9 @@ Ideas that have been thought through but not built. Each one says what it costs
 and, where it matters, why the obvious alternative was rejected — so the
 reasoning does not have to be redone.
 
+Current correctness work and completion criteria are tracked in [MILESTONES.md](MILESTONES.md).
+Historical performance numbers below are not measurements of the current fixes.
+
 Nothing here is scheduled. The rule from `TESTING.md` applies: measure before
 optimising. Four earlier theories about where time went were all falsified.
 
@@ -21,10 +24,9 @@ per (address, protocol); for a 254-address pool, 3 KB against 6 MB of bitmap.
 This is the cheapest item here and it removes a pathological case, not a
 marginal one.
 
-**Not currently benchmarked.** `--pool 1` looks like it covers exhaustion but
-does not: those rejections come from `check_user_limits()` hitting the
-4096-per-user cap *before* the port search runs. The "rejects in O(1)" line in
-`TESTING.md` refers to that path, not this one.
+The benchmark now sets `user_max_sessions=65535` so the default quota does not
+mask pool exhaustion. Check its `noport` and `ulimit` counters rather than
+assuming which limit fired. Controlled near-full occupancy remains outstanding.
 
 ### 2. Two-level summary bitmap
 
@@ -82,8 +84,8 @@ alternatives.
 
 ### 4. `--fill <percent>` mode for `bench-cps.sh`
 
-Nothing in the suite enters the regime items 1 and 2 target. Sparse pools hit
-`test_and_set_bit()` on the first try; exhausted ones reject at the user cap.
+The suite still needs a controlled near-full occupancy mode. Sparse pools hit
+`test_and_set_bit()` on the first try; exhaustion must be classified by counters.
 A mode that loads a pool to 95–99% and then measures allocation cost would show
 whether either is worth building. **This should land before item 1 or 2.**
 
@@ -96,23 +98,24 @@ configuration with a tighter band for per-session changes.
 
 ### 6. Measure the DNAT reply path
 
-The 1.78M pps forwarding figure is SNAT-direction only. Both directions share
+The historical 1.78M pps figure was generator-side SNAT traffic, not verified
+receiver goodput. The benchmark now reports receiver-counted SNAT packets too. Both directions share
 the lookup, so the reply path is inferred rather than measured.
 
 ## Coverage
 
-### 7. Run the remaining CI legs
+### 7. Kernel coverage
 
-`testing-kernels.yaml` has eight kernels. The 6.19 leg has been reproduced
-locally and passes; the other seven have never been run. It is also
-`workflow_dispatch` only.
+The workflow now resolves active upstream stable/LTS and mainline kernels, plus
+Debian 13, Ubuntu 24.04 GA/HWE, Ubuntu 26.04 and current Fedora releases. It runs
+on pushes, PRs, a schedule and manual dispatch. See [TESTING.md](TESTING.md) for
+the current matrix and distinguish configured coverage from completed runs.
 
-### 8. `--kdir` on something other than 7.0
+### 8. Debug kernels
 
-KASAN and lockdep runs have only ever used a 7.0 kernel. The compat shims that
-matter — `sockaddr_unsized` at 6.19, `skb_ensure_writable` at 5.2,
-`timer_delete_sync` at 6.16 — are exactly what a single-version debug run cannot
-exercise.
+Debug runs are no longer limited to Linux 7.0. Local validation has covered
+5.10.273 and 7.4-rc1 under KASAN/lockdep. New safety changes require their own
+regression results, recorded in [MILESTONES.md](MILESTONES.md).
 
 ## Protocol
 
@@ -139,7 +142,7 @@ raw/PREROUTING
 ```
 
 `nat_tg()` returns `NF_ACCEPT` on every path, which terminates `ipt_do_table`
-for the table, so rule 2 never runs. Inbound packets are conntracked today —
+for the table, so rule 2 never runs. That incorrect ordering would conntrack inbound packets —
 every return flow allocates an entry, which is the exhaustion rules 2 and 3
 exist to prevent. `README.md` and `testnet.sh` both produce this order.
 

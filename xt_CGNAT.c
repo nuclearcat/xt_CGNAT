@@ -16,6 +16,8 @@
 #include <linux/bitmap.h>
 #include <linux/jump_label.h>
 #include <linux/mm.h>
+#include <linux/overflow.h>
+#include <linux/workqueue.h>
 #include <net/tcp.h>
 #include "compat.h"
 #include "xt_CGNAT.h"
@@ -26,8 +28,8 @@
 
 /* Which pool a session belongs to, in the spare flag bits. The session struct
  * is exactly one cacheline and there is no room to grow it, but flags had five
- * bits free. Every other writer of this byte uses |= or &= on a single bit, so
- * the index survives a lost update regardless of which writer wins.
+ * bits free. All updates use the packed-state CAS helpers, which preserve the immutable
+ * pool index and protocol while changing timeout and mutable flags.
  */
 #define FLAG_POOL_SHIFT 3
 #define FLAG_POOL_BITS  3
@@ -71,6 +73,16 @@ static unsigned int pdu_seq = 0;
 struct netflow9_pdu pdu;
 struct netflow9_template templateV9;
 static DEFINE_SPINLOCK(nfsend_lock);
+#define NF_QUEUE_SIZE 64
+struct nf_batch {
+    struct netflow9_pdu pdu;
+    int len;
+};
+static struct nf_batch nf_queue[NF_QUEUE_SIZE];
+static unsigned int nf_head, nf_tail, nf_count;
+static atomic64_t nf_dropped = ATOMIC64_INIT(0);
+static void nf_send_worker(struct work_struct *work);
+static DECLARE_WORK(nf_send_work, nf_send_worker);
 
 /* Counters touched during normal operation, per CPU. As shared atomic64 these
  * were three bounces of the same cacheline for every session created and a
@@ -292,7 +304,7 @@ static DEFINE_STATIC_KEY_FALSE(nat_custom_tmt);
 
 /* Session timeout for one event, from the session's own pool - the pool its
  * port came from, which is not necessarily the pool named by whichever rule
- * this packet traversed. sess->flags is already in hand at every call site for
+ * this packet traversed. session_flags(sess) is already in hand at every call site for
  * the FLAG_REPLIED test, so the pool index costs nothing to recover.
  */
 #define NAT_TMT(sess, field, builtin)                                       \
@@ -313,6 +325,7 @@ struct nat_pool {
 
     bool used;                          /* slot occupied */
     atomic_t refcnt;                    /* iptables rules pointing here */
+    atomic64_t sessions;                /* lifetime references, not sampled stats */
     char name[XT_CGNAT_POOL_NAMELEN];
     u_int32_t start, end;               /* network order, inclusive */
     unsigned int size;                  /* addresses */
@@ -322,7 +335,7 @@ struct nat_pool {
 
     /* deterministic mapping, RFC 7422; det_ports 0 means shared ports */
     u_int32_t det_base;                 /* first subscriber address, host order */
-    u_int32_t det_count;                /* addresses in the subscriber range */
+    u64 det_count;                /* addresses in the subscriber range */
     unsigned int det_ports;             /* ports per subscriber */
     unsigned int det_per_addr;          /* subscribers sharing one NAT address */
 
@@ -331,7 +344,7 @@ struct nat_pool {
 
 static struct nat_pool nat_pools[CGNAT_MAX_POOLS];
 
-/* Writers only. The packet path never walks this array - a rule carries a
+/* Pool lifetime mutex. The packet path never walks this array - a rule carries a
  * resolved pointer and a session carries its index - so readers that do walk
  * it (checkentry, /proc) are all in process context and can just take the
  * mutex.
@@ -455,9 +468,7 @@ struct nat_session {
     uint32_t nat_addr;
     uint16_t in_port;
     uint16_t out_port;
-    int16_t  timeout;
-    uint8_t  proto;
-    uint8_t  flags;
+    atomic_t state;                    /* signed timeout:16, proto:8, flags:8 */
 };
 
 /* A private cache, not the shared kmalloc pool: sessions are allocated and
@@ -471,15 +482,120 @@ struct nat_session {
  */
 static struct kmem_cache *nat_session_cache __read_mostly;
 
+/* Packed state keeps the session at 64 bytes and gives every architecture a
+ * native atomic transition. Once timeout becomes nonpositive, no packet can
+ * revive it. RCU alone protects memory lifetime, not port ownership.
+ */
+static inline int session_timeout(const struct nat_session *s)
+{
+    return (s16)(u32)atomic_read(&s->state);
+}
+
+static inline u8 session_proto(const struct nat_session *s)
+{
+    return (u32)atomic_read(&s->state) >> 16;
+}
+
+static inline u8 session_flags(const struct nat_session *s)
+{
+    return (u32)atomic_read(&s->state) >> 24;
+}
+
 static inline struct nat_pool *pool_of(const struct nat_session *sess)
 {
-    return &nat_pools[(sess->flags & FLAG_POOL_MASK) >> FLAG_POOL_SHIFT];
+    return &nat_pools[(session_flags(sess) & FLAG_POOL_MASK) >> FLAG_POOL_SHIFT];
+}
+
+/* Returns false when GC already committed expiry; callers drop that packet.
+ * Inbound FIN/RST is not evidence of a valid TCP close: this full-cone target
+ * does not validate remote endpoints or sequence numbers. Only the subscriber
+ * can shorten its TCP mapping. Other inbound packets retain first-reply aging.
+ */
+static bool session_touch(struct nat_session *s, bool inbound, bool fin_rst)
+{
+    u32 old = atomic_read(&s->state), next;
+    unsigned int flags, proto;
+    int timeout;
+
+    for (;;) {
+        timeout = (s16)old;
+        if (timeout <= 0)
+            return false;
+        flags = old >> 24;
+        proto = (old >> 16) & 0xff;
+        switch (proto) {
+        case IPPROTO_TCP:
+            if (inbound) {
+                if (!fin_rst && !(flags & (FLAG_REPLIED | FLAG_TCP_FIN))) {
+                    timeout = NAT_TMT(s, tcp_est, TMT_TCP_EST);
+                    flags |= FLAG_REPLIED;
+                }
+            } else if (fin_rst) {
+                timeout = NAT_TMT(s, tcp_fin, TMT_TCP_FIN);
+                flags |= FLAG_TCP_FIN;
+            } else if (flags & FLAG_TCP_FIN) {
+                timeout = NAT_TMT(s, tcp_fin, TMT_TCP_FIN);
+                flags &= ~FLAG_TCP_FIN;
+            } else {
+                timeout = (flags & FLAG_REPLIED) ? NAT_TMT(s, tcp_est, TMT_TCP_EST)
+                                                 : NAT_TMT(s, tcp, TMT_TCP);
+            }
+            break;
+        case IPPROTO_UDP:
+            if (!inbound || !(flags & FLAG_REPLIED)) {
+                if (inbound || (flags & FLAG_REPLIED))
+                    timeout = (flags & FLAG_SHORTLIVED) ? NAT_TMT(s, udp_dns, TMT_UDP_DNS)
+                                                       : NAT_TMT(s, udp_est, TMT_UDP_EST);
+                else
+                    timeout = NAT_TMT(s, udp, TMT_UDP);
+            }
+            if (inbound)
+                flags |= FLAG_REPLIED;
+            break;
+        case IPPROTO_ICMP:
+            if (!inbound || !(flags & FLAG_REPLIED))
+                timeout = NAT_TMT(s, icmp, TMT_ICMP);
+            if (inbound)
+                flags |= FLAG_REPLIED;
+            break;
+        default:
+            if (!inbound || !(flags & FLAG_REPLIED))
+                timeout = (inbound || (flags & FLAG_REPLIED))
+                        ? NAT_TMT(s, other_est, TMT_OTHER_EST) : NAT_TMT(s, other, TMT_OTHER);
+            if (inbound)
+                flags |= FLAG_REPLIED;
+        }
+        next = (old & 0x00ff0000U) | ((u32)flags << 24) | (u16)timeout;
+        if ((u32)atomic_cmpxchg(&s->state, old, next) == old)
+            return true;
+        old = atomic_read(&s->state);
+    }
+}
+
+static int session_age(struct nat_session *s)
+{
+    u32 old = atomic_read(&s->state), next;
+    int timeout;
+
+    do {
+        timeout = (s16)old - NAT_GC_STEP;
+        next = (old & 0xffff0000U) | (u16)timeout;
+        if ((u32)atomic_cmpxchg(&s->state, old, next) == old)
+            return timeout;
+        old = atomic_read(&s->state);
+    } while (1);
 }
 
 static void nat_session_free_rcu(struct rcu_head *head)
 {
-    kmem_cache_free(nat_session_cache,
-                    container_of(head, struct nat_session, u.rcu));
+    struct nat_session *sess = container_of(head, struct nat_session, u.rcu);
+    struct nat_pool *pool = pool_of(sess);
+
+    kmem_cache_free(nat_session_cache, sess);
+    /* A different-pool rule may still have found this global mapping under
+     * RCU. Keep its originating pool alive until every such reader is gone.
+     */
+    atomic64_dec(&pool->sessions);
 }
 
 struct xt_cgnat_users_htable {
@@ -584,7 +700,10 @@ static int pool_table_create(struct nat_pool *pool)
     size_t sz, bsz;
     unsigned int i;
 
-    sz = sizeof(spinlock_t) * (size_t)pool->size;
+    if (check_mul_overflow((size_t)pool->size, sizeof(spinlock_t), &sz) ||
+        check_mul_overflow((size_t)pool->size,
+                           (size_t)NAT_PROTO_SLOTS * NAT_PORT_LONGS * sizeof(unsigned long), &bsz))
+        return -EOVERFLOW;
     pool->create_lock = kvzalloc(sz, GFP_KERNEL);
     if (pool->create_lock == NULL)
         return -ENOMEM;
@@ -593,7 +712,6 @@ static int pool_table_create(struct nat_pool *pool)
 
     /* 8KB per protocol per NAT address: 24KB an address, 6MB for a /24. A pool
      * large enough for that to hurt could not hold the sessions to fill it. */
-    bsz = (size_t)pool->size * NAT_PROTO_SLOTS * NAT_PORT_LONGS * sizeof(unsigned long);
     pool->port_bitmap = kvzalloc(bsz, GFP_KERNEL);
     if (pool->port_bitmap == NULL) {
         printk(KERN_ERR "xt_CGNAT: pool '%s': cannot allocate %zu bytes of port bitmaps\n",
@@ -723,7 +841,7 @@ static void nat_htable_remove(void)
     for (i = 0; i < nat_hash_size; i++) {
         spin_lock_bh(&ht_inner[i].lock);
         hlist_for_each_entry_safe(sess, next, &ht_inner[i].session, inner_node) {
-            ohash = get_hash_nat_ent(sess->proto, sess->nat_addr, sess->out_port);
+            ohash = get_hash_nat_ent(session_proto(sess), sess->nat_addr, sess->out_port);
             spin_lock_bh(&ht_outer[ohash].lock);
             hlist_del_rcu(&sess->outer_node);
             ht_outer[ohash].use--;
@@ -795,7 +913,7 @@ static struct nat_session *lookup_session_in(const uint8_t proto, const u_int32_
 
     hash = get_hash_nat_ent(proto, addr, port);
     hlist_for_each_entry_rcu(s, &ht_inner[hash].session, inner_node) {
-        if (s->in_addr == addr && s->in_port == port && s->proto == proto && s->timeout > 0)
+        if (s->in_addr == addr && s->in_port == port && session_proto(s) == proto && session_timeout(s) > 0)
             return s;
     }
     return NULL;
@@ -808,7 +926,7 @@ static struct nat_session *lookup_session_out(const uint8_t proto, const u_int32
 
     hash = get_hash_nat_ent(proto, addr, port);
     hlist_for_each_entry_rcu(s, &ht_outer[hash].session, outer_node) {
-        if (s->nat_addr == addr && s->out_port == port && s->proto == proto && s->timeout > 0)
+        if (s->nat_addr == addr && s->out_port == port && session_proto(s) == proto && session_timeout(s) > 0)
             return s;
     }
     return NULL;
@@ -825,7 +943,7 @@ static struct nat_session *lookup_session_out(const uint8_t proto, const u_int32
  */
 static inline void nat_release_port(struct nat_session *sess)
 {
-    unsigned long *map = nat_ports_for(pool_of(sess), sess->nat_addr, sess->proto);
+    unsigned long *map = nat_ports_for(pool_of(sess), sess->nat_addr, session_proto(sess));
 
     if (map)
         clear_bit(ntohs(sess->out_port), map);
@@ -864,59 +982,13 @@ static uint16_t search_free_l4_port(const struct nat_pool *pool, const uint8_t p
     return htons(port);
 }
 
-static int check_user_limits(const u_int8_t proto, const u_int32_t addr)
-{
-    struct user_htable_ent *user;
-    struct hlist_head *head;
-    unsigned int hash, is_found, ret;
-    unsigned int sessions, session_limit;
-
-    hash = get_hash_user_ent(addr);
-    rcu_read_lock_bh();
-    head = &ht_users[hash].user;
-    is_found=0;
-    /* read the tunable once: it is writable at runtime via sysfs, and the
-     * counters it is compared against are uint16_t */
-    session_limit = READ_ONCE(user_max_sessions);
-    if (session_limit < 1)
-        session_limit = 1;
-    else if (session_limit > USHRT_MAX)
-        session_limit = USHRT_MAX;
-
-    hlist_for_each_entry_rcu(user, head, list_node) {
-        if (user->addr == addr && user->idle < 15) {
-            if (proto == IPPROTO_TCP)
-                sessions = user->tcp_count;
-            else if (proto == IPPROTO_UDP)
-                sessions = user->udp_count;
-            else
-                sessions = user->other_count;
-            is_found=1;
-            break;
-        }
-    }
-
-    ret=1;
-    if (is_found==1) {
-        if (sessions < session_limit) {
-            ret=1;
-        } else {
-            ret=0;
-        }
-    } else {
-        ret=1;
-    }
-    rcu_read_unlock_bh();
-    return ret;
-}
-
-static void update_user_limits(const u_int8_t proto, const u_int32_t addr, const int8_t operation)
+static int update_user_limits(const u_int8_t proto, const u_int32_t addr, const int8_t operation)
 {
     struct user_htable_ent *user;
     struct hlist_head *head;
     uint16_t *count;
     unsigned int hash, is_found;
-    unsigned int sz;
+    unsigned int sz, limit;
 
     hash = get_hash_user_ent(addr);
     spin_lock_bh(&ht_users[hash].lock);
@@ -939,7 +1011,7 @@ static void update_user_limits(const u_int8_t proto, const u_int32_t addr, const
          */
         if (operation < 0) {
             spin_unlock_bh(&ht_users[hash].lock);
-            return;
+            return operation < 0 ? 0 : -ENOMEM;
         }
 
         sz = sizeof(struct user_htable_ent);
@@ -949,7 +1021,7 @@ static void update_user_limits(const u_int8_t proto, const u_int32_t addr, const
             atomic64_inc(&ses_fail_nomem);
             printk_ratelimited(KERN_WARNING "xt_CGNAT update_user_limits ERROR: Cannot allocate memory for user_session\n");
             spin_unlock_bh(&ht_users[hash].lock);
-            return;
+            return operation < 0 ? 0 : -ENOMEM;
         }
 
         user->addr = addr;
@@ -977,11 +1049,16 @@ static void update_user_limits(const u_int8_t proto, const u_int32_t addr, const
                    &addr, proto);
         }
     } else {
+        limit = clamp_t(unsigned int, READ_ONCE(user_max_sessions), 1, USHRT_MAX);
+        if (*count >= limit) {
+            spin_unlock_bh(&ht_users[hash].lock);
+            return -ENOSPC;
+        }
         (*count)++;
     }
 
     spin_unlock_bh(&ht_users[hash].lock);
-    return;
+    return 0;
 }
 
 /* socket code */
@@ -1048,6 +1125,27 @@ static void netflow_sendmsg(void *buffer, const int len)
     }
 }
 
+/* The worker is the sole socket owner. No socket allocation, connect, send
+ * or release occurs under a spinlock or in a timer/packet callback.
+ */
+static void nf_send_worker(struct work_struct *work)
+{
+    struct nf_batch batch;
+
+    for (;;) {
+        spin_lock_bh(&nfsend_lock);
+        if (!nf_count) {
+            spin_unlock_bh(&nfsend_lock);
+            return;
+        }
+        batch = nf_queue[nf_tail];
+        nf_tail = (nf_tail + 1) % NF_QUEUE_SIZE;
+        nf_count--;
+        spin_unlock_bh(&nfsend_lock);
+        netflow_sendmsg(&batch.pdu, batch.len);
+    }
+}
+
 static void netflow_export_pdu_v9(void)
 {
     struct timespec64 ts;
@@ -1068,7 +1166,15 @@ static void netflow_export_pdu_v9(void)
     pdu.FlowSetIdSize	= sizeof(struct netflow9_record) * pdu_data_records;
     pdusize = NETFLOW9_HEADER_SIZE + pdu.FlowSetIdSize;
     pdu.FlowSetIdSize	= htons(pdu.FlowSetIdSize+4);
-    netflow_sendmsg(&pdu, pdusize);
+    if (nf_count == NF_QUEUE_SIZE) {
+        atomic64_inc(&nf_dropped);
+    } else {
+        nf_queue[nf_head].pdu = pdu;
+        nf_queue[nf_head].len = pdusize;
+        nf_head = (nf_head + 1) % NF_QUEUE_SIZE;
+        nf_count++;
+        schedule_work(&nf_send_work);
+    }
     pdu_seq++;
     pdu_data_records = 0;
 }
@@ -1077,6 +1183,8 @@ static void netflow_export_flow_v9(const uint8_t proto, const u_int32_t srcaddr,
 {
     struct netflow9_record *rec;
 
+    if (list_empty(&usock_list))
+        return;
     spin_lock_bh(&nfsend_lock);
 
     rec = &pdu.flow[pdu_data_records++];
@@ -1102,7 +1210,9 @@ static struct nat_session *create_nat_session(struct nat_pool *pool, const uint8
     unsigned int lo = NAT_PORT_LO, hi = NAT_PORT_BITS;
     u_int32_t nataddr;
     uint16_t natport;
-    unsigned int nataddr_id, hash;
+    unsigned int nataddr_id, hash, ihash;
+    int ret;
+    unsigned int timeout, flags;
 
     POOL_STAT_INC(pool, tried);
 
@@ -1117,12 +1227,6 @@ static struct nat_session *create_nat_session(struct nat_pool *pool, const uint8
         }
     } else {
         nataddr = get_nat_addr(pool, useraddr);
-    }
-
-    if (unlikely(check_user_limits(proto, useraddr) == 0)) {
-        POOL_STAT_INC(pool, ulimit);
-        printk_ratelimited(KERN_NOTICE "xt_CGNAT: %pI4 exceed max allowed sessions\n", &useraddr);
-        return NULL;
     }
 
     /* allocated before the lock: nothing here needs it, and on the paths that
@@ -1146,15 +1250,29 @@ static struct nat_session *create_nat_session(struct nat_pool *pool, const uint8
         spin_unlock_bh(&pool->create_lock[nataddr_id]);
         kmem_cache_free(nat_session_cache, sess);
         POOL_STAT_INC(pool, dup);
+        if (!session_touch(existing, false, false)) {
+            rcu_read_unlock_bh();
+            return NULL;
+        }
         return existing;
     }
     rcu_read_unlock_bh();
+
+    ret = update_user_limits(proto, useraddr, 1);
+    if (ret) {
+        if (ret == -ENOSPC)
+            POOL_STAT_INC(pool, ulimit);
+        spin_unlock_bh(&pool->create_lock[nataddr_id]);
+        kmem_cache_free(nat_session_cache, sess);
+        return NULL;
+    }
 
     if (likely(proto == IPPROTO_TCP || proto == IPPROTO_UDP || proto == IPPROTO_ICMP)) {
         rcu_read_lock_bh();
         natport = search_free_l4_port(pool, proto, nataddr, userport, lo, hi);
         rcu_read_unlock_bh();
         if (natport == 0) {
+            update_user_limits(proto, useraddr, -1);
             POOL_STAT_INC(pool, noport);
             printk_ratelimited(KERN_WARNING "xt_CGNAT create_nat_session ERROR: Not found free nat port for %d %pI4:%u -> %pI4:XXXX\n", proto, &useraddr, userport, &nataddr);
             spin_unlock_bh(&pool->create_lock[nataddr_id]);
@@ -1162,6 +1280,29 @@ static struct nat_session *create_nat_session(struct nat_pool *pool, const uint8
             return NULL;
         }
     } else {
+        /* Generic protocols have no port discriminator. Serialize ownership
+         * with all creators for this public address; a quarantine reservation
+         * remains occupied until GC unlinks it.
+         */
+        bool occupied = false;
+        rcu_read_lock_bh();
+        hash = get_hash_nat_ent(proto, nataddr, 0);
+        hlist_for_each_entry_rcu(existing, &ht_outer[hash].session, outer_node) {
+            if (session_proto(existing) == proto && existing->nat_addr == nataddr &&
+                (session_timeout(existing) > 0 ||
+                 (session_flags(existing) & FLAG_QUARANTINE))) {
+                occupied = true;
+                break;
+            }
+        }
+        rcu_read_unlock_bh();
+        if (occupied) {
+            update_user_limits(proto, useraddr, -1);
+            POOL_STAT_INC(pool, noport);
+            spin_unlock_bh(&pool->create_lock[nataddr_id]);
+            kmem_cache_free(nat_session_cache, sess);
+            return NULL;
+        }
         natport = userport;
     }
 
@@ -1171,8 +1312,7 @@ static struct nat_session *create_nat_session(struct nat_pool *pool, const uint8
     sess->out_port   = natport;
     sess->u.dst.addr = dstaddr;
     sess->u.dst.port = dstport;
-    sess->proto      = proto;
-    sess->flags      = (READ_ONCE(port_quarantine) ? FLAG_QUARANTINE : 0)
+    flags = (READ_ONCE(port_quarantine) ? FLAG_QUARANTINE : 0)
                        | ((unsigned)(pool - nat_pools) << FLAG_POOL_SHIFT);
 
     /* Nothing has replied yet, so this is the unreplied timeout for the
@@ -1181,40 +1321,56 @@ static struct nat_session *create_nat_session(struct nat_pool *pool, const uint8
      * struct that is about to be touched anyway does not need the static key.
      */
     switch (proto) {
-    case IPPROTO_TCP:  sess->timeout = pool->tmt.tcp;  break;
-    case IPPROTO_UDP:  sess->timeout = pool->tmt.udp;  break;
-    case IPPROTO_ICMP: sess->timeout = pool->tmt.icmp; break;
-    default:           sess->timeout = pool->tmt.other; break;
+    case IPPROTO_TCP:  timeout = pool->tmt.tcp;  break;
+    case IPPROTO_UDP:  timeout = pool->tmt.udp;  break;
+    case IPPROTO_ICMP: timeout = pool->tmt.icmp; break;
+    default:           timeout = pool->tmt.other; break;
     }
 
     /* Only UDP: 53/tcp is a zone transfer or a truncated-response retry, both
      * of which are ordinary connections that deserve the ordinary timeout.
      */
     if (proto == IPPROTO_UDP && dstport == htons(53))
-        sess->flags |= FLAG_SHORTLIVED;
+        flags |= FLAG_SHORTLIVED;
 
-    hash = get_hash_nat_ent(proto, useraddr, userport);
-    spin_lock_bh(&ht_inner[hash].lock);
-    hlist_add_head_rcu(&sess->inner_node, &ht_inner[hash].session);
-    ht_inner[hash].use++;
-    spin_unlock_bh(&ht_inner[hash].lock);
+    atomic_set(&sess->state, (flags << 24) | ((u32)proto << 16) | timeout);
+
+    rcu_read_lock_bh();
+    ihash = get_hash_nat_ent(proto, useraddr, userport);
+    spin_lock_bh(&ht_inner[ihash].lock);
+    /* Rules selecting different pools have different address locks. The inner
+     * bucket is the common serialization point for the global subscriber key.
+     */
+    existing = lookup_session_in(proto, useraddr, userport);
+    if (unlikely(existing)) {
+        spin_unlock_bh(&ht_inner[ihash].lock);
+        nat_release_port(sess);
+        update_user_limits(proto, useraddr, -1);
+        spin_unlock_bh(&pool->create_lock[nataddr_id]);
+        kmem_cache_free(nat_session_cache, sess);
+        POOL_STAT_INC(pool, dup);
+        if (!session_touch(existing, false, false)) {
+            rcu_read_unlock_bh();
+            return NULL;
+        }
+        return existing;
+    }
+    atomic64_inc(&pool->sessions);
+    POOL_STAT_INC(pool, active);
+    POOL_STAT_INC(pool, created);
+    netflow_export_flow_v9(proto, useraddr, userport, dstaddr, dstport, nataddr, natport, 1);
+    hlist_add_head_rcu(&sess->inner_node, &ht_inner[ihash].session);
+    ht_inner[ihash].use++;
 
     hash = get_hash_nat_ent(proto, nataddr, natport);
     spin_lock_bh(&ht_outer[hash].lock);
     hlist_add_head_rcu(&sess->outer_node, &ht_outer[hash].session);
     ht_outer[hash].use++;
     spin_unlock_bh(&ht_outer[hash].lock);
-
+    spin_unlock_bh(&ht_inner[ihash].lock);
     spin_unlock_bh(&pool->create_lock[nataddr_id]);
 
-    update_user_limits(proto, useraddr, 1);
-    netflow_export_flow_v9(proto, useraddr, userport, dstaddr, dstport, nataddr, natport, 1);
-
-    POOL_STAT_INC(pool, created);
-    POOL_STAT_INC(pool, active);
-
-    /* published above; the caller drops this read lock */
-    rcu_read_lock_bh();
+    /* The read lock was acquired before publication; the caller drops it. */
     return sess;
 }
 
@@ -1277,18 +1433,10 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 ip->saddr = session->nat_addr;
                 tcp->source = session->out_port;
 
-                if (tcp->fin || tcp->rst) {
-                    session->timeout = NAT_TMT(session, tcp_fin, TMT_TCP_FIN);
-                    session->flags |= FLAG_TCP_FIN;
-                } else if (session->flags & FLAG_TCP_FIN) {
-                    session->timeout = NAT_TMT(session, tcp_fin, TMT_TCP_FIN);
-                    session->flags &= ~FLAG_TCP_FIN;
-                } else if ((session->flags & FLAG_REPLIED) == 0) {
-                    session->timeout = NAT_TMT(session, tcp, TMT_TCP);
-                } else {
-                    session->timeout = NAT_TMT(session, tcp_est, TMT_TCP_EST);
+                if (!session_touch(session, false, tcp->fin || tcp->rst)) {
+                    rcu_read_unlock_bh();
+                    return NF_DROP;
                 }
-
                 rcu_read_unlock_bh();
             } else {
                 rcu_read_unlock_bh();
@@ -1331,12 +1479,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 }
                 ip->saddr = session->nat_addr;
                 udp->source = session->out_port;
-                if ((session->flags & FLAG_REPLIED) == 0) {
-                    session->timeout = NAT_TMT(session, udp, TMT_UDP);
-                } else if (session->flags & FLAG_SHORTLIVED) {
-                    session->timeout = NAT_TMT(session, udp_dns, TMT_UDP_DNS);
-                } else {
-                    session->timeout = NAT_TMT(session, udp_est, TMT_UDP_EST);
+                if (!session_touch(session, false, false)) {
+                    rcu_read_unlock_bh();
+                    return NF_DROP;
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1385,7 +1530,10 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->out_port, true);
                     icmp->un.echo.id = session->out_port;
                 }
-                session->timeout = NAT_TMT(session, icmp, TMT_ICMP);
+                if (!session_touch(session, false, false)) {
+                    rcu_read_unlock_bh();
+                    return NF_DROP;
+                }
                 rcu_read_unlock_bh();
             } else {
                 rcu_read_unlock_bh();
@@ -1414,10 +1562,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             if (session) {
                 csum_replace4(&ip->check, ip->saddr, session->nat_addr);
                 ip->saddr = session->nat_addr;
-                if ((session->flags & FLAG_REPLIED) == 0) {
-                    session->timeout = NAT_TMT(session, other, TMT_OTHER);
-                } else {
-                    session->timeout = NAT_TMT(session, other_est, TMT_OTHER_EST);
+                if (!session_touch(session, false, false)) {
+                    rcu_read_unlock_bh();
+                    return NF_DROP;
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1458,15 +1605,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 inet_proto_csum_replace2(&tcp->check, skb, tcp->dest, session->in_port, true);
                 ip->daddr = session->in_addr;
                 tcp->dest = session->in_port;
-                if (tcp->fin || tcp->rst) {
-                    session->timeout = NAT_TMT(session, tcp_fin, TMT_TCP_FIN);
-                    session->flags |= FLAG_TCP_FIN;
-                } else if (session->flags & FLAG_TCP_FIN) {
-                    session->timeout = NAT_TMT(session, tcp_fin, TMT_TCP_FIN);
-                    session->flags &= ~FLAG_TCP_FIN;
-                } else if ((session->flags & FLAG_REPLIED) == 0) {
-                    session->timeout = NAT_TMT(session, tcp_est, TMT_TCP_EST);
-                    session->flags |= FLAG_REPLIED;
+                if (!session_touch(session, true, tcp->fin || tcp->rst)) {
+                    rcu_read_unlock_bh();
+                    return NF_DROP;
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1501,11 +1642,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 ip->daddr = session->in_addr;
                 udp->dest = session->in_port;
 
-                if ((session->flags & FLAG_REPLIED) == 0) {
-                    session->timeout = (session->flags & FLAG_SHORTLIVED)
-                                     ? NAT_TMT(session, udp_dns, TMT_UDP_DNS)
-                                     : NAT_TMT(session, udp_est, TMT_UDP_EST);
-                    session->flags |= FLAG_REPLIED;
+                if (!session_touch(session, true, false)) {
+                    rcu_read_unlock_bh();
+                    return NF_DROP;
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1668,9 +1807,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->in_port, true);
                     icmp->un.echo.id = session->in_port;
                 }
-                if ((session->flags & FLAG_REPLIED) == 0) {
-                    session->timeout = NAT_TMT(session, icmp, TMT_ICMP);
-                    session->flags |= FLAG_REPLIED;
+                if (!session_touch(session, true, false)) {
+                    rcu_read_unlock_bh();
+                    return NF_DROP;
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1690,9 +1829,9 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             if (likely(session)) {
                 csum_replace4(&ip->check, ip->daddr, session->in_addr);
                 ip->daddr = session->in_addr;
-                if ((session->flags & FLAG_REPLIED) == 0) {
-                    session->timeout = NAT_TMT(session, other_est, TMT_OTHER_EST);
-                    session->flags |= FLAG_REPLIED;
+                if (!session_touch(session, true, false)) {
+                    rcu_read_unlock_bh();
+                    return NF_DROP;
                 }
                 rcu_read_unlock_bh();
             } else {
@@ -1757,6 +1896,7 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
     struct nat_session *sess;
     struct hlist_node *next;
     unsigned int i, ohash;
+    int timeout;
     uint8_t proto;
     u_int32_t addr;
     u_int32_t vector_start, vector_end;
@@ -1788,7 +1928,7 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
         spin_lock_bh(&ht_inner[i].lock);
         if (ht_inner[i].use > 0) {
             hlist_for_each_entry_safe(sess, next, &ht_inner[i].session, inner_node) {
-                sess->timeout -= NAT_GC_STEP;
+                timeout = session_age(sess);
                 /* One step wide, so exactly one sweep lands in it for any
                  * starting value. The old test was == 0, which only ever fired
                  * because every timeout assigned was a multiple of the step:
@@ -1799,9 +1939,9 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
                  * rounds to a step as well, and this survives if it ever
                  * stops.
                  */
-                if (sess->timeout <= 0 && sess->timeout > -NAT_GC_STEP) {
+                if (timeout <= 0 && timeout > -NAT_GC_STEP) {
                     /* last read of u.dst: the union becomes an rcu_head below */
-                    netflow_export_flow_v9(sess->proto, sess->in_addr, sess->in_port,
+                    netflow_export_flow_v9(session_proto(sess), sess->in_addr, sess->in_port,
                                            sess->u.dst.addr, sess->u.dst.port,
                                            sess->nat_addr, sess->out_port, 2);
 
@@ -1812,12 +1952,12 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
                      * quarantine, at the cost of that many ports per second of
                      * churn being unavailable.
                      */
-                    if (!(sess->flags & FLAG_QUARANTINE))
+                    if (!(session_flags(sess) & FLAG_QUARANTINE))
                         nat_release_port(sess);
-                } else if (sess->timeout <= -NAT_GC_STEP) {
-                    if (sess->flags & FLAG_QUARANTINE)
+                } else if (timeout <= -NAT_GC_STEP) {
+                    if (session_flags(sess) & FLAG_QUARANTINE)
                         nat_release_port(sess);
-                    proto = sess->proto;
+                    proto = session_proto(sess);
                     addr  = sess->in_addr;
 
                     ohash = get_hash_nat_ent(proto, sess->nat_addr, sess->out_port);
@@ -1829,9 +1969,9 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
                     hlist_del_rcu(&sess->inner_node);
                     ht_inner[i].use--;
 
-                    call_rcu(&sess->u.rcu, nat_session_free_rcu);
                     POOL_STAT_DEC(pool_of(sess), active);
                     update_user_limits(proto, addr, -1);
+                    call_rcu(&sess->u.rcu, nat_session_free_rcu);
                 }
             }
         }
@@ -1897,15 +2037,15 @@ static int nat_seq_show(struct seq_file *m, void *v)
         if (ht_outer[i].use > 0) {
             head = &ht_outer[i].session;
             hlist_for_each_entry_rcu(session, head, outer_node) {
-                if (session->timeout > 0) {
+                if (session_timeout(session) > 0) {
                     seq_printf(m, "%d %pI4:%u -> %pI4:%u --- ttl: %d\n",
-                               session->proto,
+                               session_proto(session),
                                &session->in_addr, ntohs(session->in_port),
                                &session->nat_addr, ntohs(session->out_port),
-                               session->timeout);
+                               session_timeout(session));
                 } else {
                     seq_printf(m, "%d %pI4:%u -> %pI4:%u --- (will be removed due timeout)\n",
-                               session->proto,
+                               session_proto(session),
                                &session->in_addr, ntohs(session->in_port),
                                &session->nat_addr, ntohs(session->out_port));
                 }
@@ -1981,6 +2121,7 @@ static int pools_seq_show(struct seq_file *m, void *v)
     struct nat_pool *p;
     int i;
 
+    mutex_lock(&nat_pools_mutex);
     seq_printf(m, "# write \"add [<name>:]<start>-<end>[:<cidr>:<ports>][:<key>=<sec>...]\" or \"del <name>\"\n");
     for_each_pool(i, p) {
         seq_printf(m, "pool %s\n", p->name);
@@ -1993,8 +2134,8 @@ static int pools_seq_show(struct seq_file *m, void *v)
                    p->tmt.udp, p->tmt.udp_est, p->tmt.udp_dns,
                    p->tmt.icmp, p->tmt.other, p->tmt.other_est);
         if (pool_det_enabled(p))
-            seq_printf(m, "  deterministic: %u subscribers, %u ports each, %u per address\n",
-                       p->det_count, p->det_ports, p->det_per_addr);
+            seq_printf(m, "  deterministic: %llu subscribers, %u ports each, %u per address\n",
+                       (unsigned long long)p->det_count, p->det_ports, p->det_per_addr);
         else
             seq_printf(m, "  deterministic: off (shared ports)\n");
         seq_printf(m, "  sessions active: %lld\n",  POOL_STAT_READ(p, active));
@@ -2006,6 +2147,7 @@ static int pools_seq_show(struct seq_file *m, void *v)
         seq_printf(m, "  failed unmapped subscriber: %lld\n", POOL_STAT_READ(p, nomap));
         seq_printf(m, "  rules referencing: %d\n", atomic_read(&p->refcnt));
     }
+    mutex_unlock(&nat_pools_mutex);
     return 0;
 }
 static int pools_seq_open(struct inode *inode, struct file *file)
@@ -2063,6 +2205,7 @@ static const struct proc_ops pools_seq_fops = {
 
 static int stat_seq_show(struct seq_file *m, void *v)
 {
+    mutex_lock(&nat_pools_mutex);
     seq_printf(m, "Active NAT sessions: %lld\n", ALL_STAT_READ(active));
     seq_printf(m, "Tried NAT sessions: %lld\n", ALL_STAT_READ(tried));
     seq_printf(m, "Created NAT sessions: %lld\n", ALL_STAT_READ(created));
@@ -2073,6 +2216,7 @@ static int stat_seq_show(struct seq_file *m, void *v)
     seq_printf(m, "Active Users: %lld\n", atomic64_read(&users_active));
     seq_printf(m, "Max sessions per user: %d\n", READ_ONCE(user_max_sessions));
     seq_printf(m, "Port quarantine: %d\n", READ_ONCE(port_quarantine));
+    seq_printf(m, "NetFlow dropped PDUs: %lld\n", atomic64_read(&nf_dropped));
 
 
     /* why session creation refused - the first two are the capacity limits */
@@ -2089,6 +2233,7 @@ static int stat_seq_show(struct seq_file *m, void *v)
     seq_printf(m, "Dropped truncated: %lld\n", atomic64_read(&pkt_drop_trunc));
     seq_printf(m, "Dropped unwritable: %lld\n", atomic64_read(&pkt_drop_unwritable));
 
+    mutex_unlock(&nat_pools_mutex);
     return 0;
 }
 static int stat_seq_open(struct inode *inode, struct file *file)
@@ -2180,20 +2325,26 @@ static int nat_tg_check(const struct xt_tgchk_param *par)
     struct xt_cgnat_tginfo *info = par->targinfo;
     struct nat_pool *pool;
 
+    if (!net_eq(par->net, &init_net))
+        return -EOPNOTSUPP;
+
     if (info->variant != XT_CGNAT_SNAT && info->variant != XT_CGNAT_DNAT) {
         printk(KERN_INFO "xt_CGNAT: rejecting rule with unknown variant %u\n", info->variant);
         return -EINVAL;
     }
 
     info->pool[XT_CGNAT_POOL_NAMELEN - 1] = '\0';
+    mutex_lock(&nat_pools_mutex);
     pool = pool_by_name(info->pool);
     if (pool == NULL) {
         printk(KERN_INFO "xt_CGNAT: no pool named '%s'\n", info->pool);
+        mutex_unlock(&nat_pools_mutex);
         return -ENOENT;
     }
     /* resolved once here so the packet path never looks a name up */
     info->priv = pool;
     atomic_inc(&pool->refcnt);
+    mutex_unlock(&nat_pools_mutex);
     return 0;
 }
 
@@ -2313,7 +2464,8 @@ static int __init nat_tmt_parse_defaults(void)
 static int nat_pool_parse_one(char *spec, struct nat_pool *pool)
 {
     char *p = spec, *first, *range, *sub = NULL, *portstr = NULL, *tok, *sep;
-    unsigned int ports, need, per_addr, prefix;
+    unsigned int ports, per_addr, prefix;
+    u64 need;
     u_int32_t subnet;
     int ret;
 
@@ -2326,6 +2478,9 @@ static int nat_pool_parse_one(char *spec, struct nat_pool *pool)
             printk(KERN_ERR "xt_CGNAT: pool needs <name>:<start>-<end>\n");
             return -EINVAL;
         }
+        if (strlen(first) >= sizeof(pool->name) ||
+            strspn(first, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.") != strlen(first))
+            return -EINVAL;
         strscpy(pool->name, first, sizeof(pool->name));
         range = strsep(&p, ":");
     }
@@ -2335,8 +2490,9 @@ static int nat_pool_parse_one(char *spec, struct nat_pool *pool)
         return -EINVAL;
     }
     *sep = '\0';
-    pool->start = in_aton(range);
-    pool->end   = in_aton(sep + 1);
+    if (!in4_pton(range, -1, (u8 *)&pool->start, '\0', NULL) ||
+        !in4_pton(sep + 1, -1, (u8 *)&pool->end, '\0', NULL))
+        return -EINVAL;
     if (!pool->start || !pool->end || ntohl(pool->start) > ntohl(pool->end)) {
         printk(KERN_ERR "xt_CGNAT: pool '%s': bad range %pI4 to %pI4\n",
                pool->name, &pool->start, &pool->end);
@@ -2384,7 +2540,8 @@ static int nat_pool_parse_one(char *spec, struct nat_pool *pool)
         return -EINVAL;
     }
     *sep = '\0';
-    subnet = in_aton(sub);
+    if (!in4_pton(sub, -1, (u8 *)&subnet, '\0', NULL))
+        return -EINVAL;
     if (kstrtouint(sep + 1, 10, &prefix) || prefix > 32) {
         printk(KERN_ERR "xt_CGNAT: pool '%s': bad subscriber prefix\n", pool->name);
         return -EINVAL;
@@ -2395,8 +2552,8 @@ static int nat_pool_parse_one(char *spec, struct nat_pool *pool)
         return -EINVAL;
     }
 
-    pool->det_count = (prefix == 0) ? 0xffffffffu : (1u << (32 - prefix));
-    pool->det_base  = ntohl(subnet) & ~(pool->det_count - 1);
+    pool->det_count = 1ULL << (32 - prefix);
+    pool->det_base = prefix ? ntohl(subnet) & (0xffffffffU << (32 - prefix)) : 0;
     pool->det_ports = ports;
     per_addr = (NAT_PORT_BITS - NAT_PORT_LO) / ports;
     if (per_addr == 0) {
@@ -2406,18 +2563,18 @@ static int nat_pool_parse_one(char *spec, struct nat_pool *pool)
     }
     pool->det_per_addr = per_addr;
 
-    need = DIV_ROUND_UP(pool->det_count, per_addr);
+    need = DIV_ROUND_UP_ULL(pool->det_count, per_addr);
     if (need > pool->size) {
-        printk(KERN_ERR "xt_CGNAT: pool '%s': deterministic mapping needs %u NAT addresses "
-                        "for %u subscribers at %u ports each (%u per address); it has %u\n",
-               pool->name, need, pool->det_count, ports, per_addr, pool->size);
+        printk(KERN_ERR "xt_CGNAT: pool '%s': deterministic mapping needs %llu NAT addresses "
+                        "for %llu subscribers at %u ports each (%u per address); it has %u\n",
+               pool->name, (unsigned long long)need, (unsigned long long)pool->det_count, ports, per_addr, pool->size);
         pool->det_ports = 0;
         return -EINVAL;
     }
 
-    printk(KERN_INFO "xt_CGNAT: pool '%s': deterministic, %u subscribers from %pI4/%u, "
-                     "%u ports each, %u per address, %u of %u addresses used\n",
-           pool->name, pool->det_count, &subnet, prefix, ports, per_addr, need, pool->size);
+    printk(KERN_INFO "xt_CGNAT: pool '%s': deterministic, %llu subscribers from %pI4/%u, "
+                     "%u ports each, %u per address, %llu of %u addresses used\n",
+           pool->name, (unsigned long long)pool->det_count, &subnet, prefix, ports, per_addr, (unsigned long long)need, pool->size);
     return 0;
 }
 
@@ -2485,6 +2642,7 @@ static int pool_add(char *spec)
 
     *slot = tmp;
     atomic_set(&slot->refcnt, 0);
+    atomic64_set(&slot->sessions, 0);
     ret = pool_table_create(slot);
     if (ret < 0) {
         memset(slot, 0, sizeof(*slot));
@@ -2510,7 +2668,7 @@ static int pool_del(const char *name)
             continue;
 
         refs   = atomic_read(&p->refcnt);
-        active = POOL_STAT_READ(p, active);
+        active = atomic64_read(&p->sessions);
         if (refs > 0 || active > 0) {
             printk(KERN_ERR "xt_CGNAT: pool '%s' still in use: %d rule(s), %lld session(s)\n",
                    p->name, refs, active);
@@ -2556,6 +2714,7 @@ static int __init nat_pool_parse(void)
             goto out;
         slot->used = true;              /* tables are built later by pools_create() */
         atomic_set(&slot->refcnt, 0);
+        atomic64_set(&slot->sessions, 0);
         if (pool_conflicts(slot) < 0) {
             ret = -EINVAL;
             goto out;
@@ -2685,6 +2844,7 @@ err_register:
     nat_timers_stop();
     nat_proc_remove();
 err_nf_dest:
+    flush_work(&nf_send_work);
     nf_destinations_remove();
 err_tables:
     pools_remove();
@@ -2703,6 +2863,10 @@ static void __exit nat_tg_exit(void)
     xt_unregister_target(&nat_tg_reg);
 
     nat_timers_stop();
+    spin_lock_bh(&nfsend_lock);
+    netflow_export_pdu_v9();
+    spin_unlock_bh(&nfsend_lock);
+    flush_work(&nf_send_work);
 
     nat_proc_remove();
 

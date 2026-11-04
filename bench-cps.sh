@@ -7,7 +7,7 @@
 # "Created NAT sessions" over the run. When creation starts failing, the
 # per-reason counters say which limit was reached:
 #
-#   Failed sessions user limit     the per-user cap (4096/proto, hardcoded)
+#   Failed sessions user limit     the configured per-subscriber accounting-group cap
 #   Failed sessions no free port   the NAT address ran out of ports
 #   Failed sessions no memory      allocation failure
 #
@@ -18,9 +18,8 @@
 #   ./bench-cps.sh --gc-cost           what the GC costs at rest, vs table size
 #   ./bench-cps.sh --netflow           with a collector attached, as deployed
 #   ./bench-cps.sh --det 1008          deterministic RFC 7422 port blocks
-#   ./bench-cps.sh --established 50    forwarding rate over established sessions,
-#                                      not session setup - the metric a NAT
-#                                      actually lives on
+#   ./bench-cps.sh --established 50    offered and receiver-counted SNAT PPS
+#                                      over a bounded session set
 #   ./bench-cps.sh --pool 1 --duration 40
 #                                      one NAT address, long enough to exhaust
 #                                      its 64512 ports and show what happens
@@ -56,9 +55,9 @@ DET_PORTS=0
 KEEP=0
 
 if [ -t 1 ]; then
-    C_G=$'\033[32m'; C_R=$'\033[31m'; C_Y=$'\033[33m'; C_B=$'\033[1m'; C_0=$'\033[0m'
+    C_R=$'\033[31m'; C_Y=$'\033[33m'; C_B=$'\033[1m'; C_0=$'\033[0m'
 else
-    C_G=""; C_R=""; C_Y=""; C_B=""; C_0=""
+    C_R=""; C_Y=""; C_B=""; C_0=""
 fi
 say()  { printf '%s\n' "$*"; }
 info() { printf '     %s\n' "$*"; }
@@ -177,6 +176,14 @@ run_once() {
         mod_up $extra || { say "${C_R}insmod failed${C_0}"; return 1; }
     fi
     rules_up
+    # Count only translated benchmark datagrams at the receiving namespace.
+    # Discard them there to avoid ICMP port-unreachable feedback contaminating
+    # a one-way benchmark. This is delivery to the receiver IP stack, not an
+    # application/checksum-validation benchmark.
+    ip netns exec "$NS_INET" iptables -N XN_BENCH_RX
+    ip netns exec "$NS_INET" iptables -A INPUT -p udp -s "$POOL_NET" \
+        -d "$INET_NET.2" --dport 9 -j XN_BENCH_RX
+    ip netns exec "$NS_INET" iptables -A XN_BENCH_RX -j DROP
 
     dmac=$(ip link show xn-s0 | awk '/link\/ether/{print $2}')
     [ -n "$dmac" ] || { say "${C_R}no mac for xn-s0${C_0}"; return 1; }
@@ -195,7 +202,11 @@ run_once() {
     done
     for pid in "${pids[@]}"; do wait "$pid"; done
 
+    sleep 0.2 # let queued packets reach the receiver before reading counters
     t1=$(date +%s.%N)
+    local delivered
+    delivered=$(ip netns exec "$NS_INET" iptables -nvxL XN_BENCH_RX | awk '$3 == "DROP" { print $1 }')
+    [ -n "$delivered" ] || die "receiver packet counter unavailable"
     after=$(snapshot)
     elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
 
@@ -220,17 +231,20 @@ run_once() {
     printf '%-12s %10s %10s %10s %10s %10s %10s\n' \
         "$label" "$pps" "$cps" "$tried" "${d[3]}" "${d[4]}" "${d[6]}"
 
+    awk -v tx="$total_sent" -v rx="$delivered" -v t="$elapsed" 'BEGIN {
+        printf "     offered: %d packets; receiver: %d packets (%.0f pps); gap: %d packets\n", tx, rx, rx/t, tx-rx
+    }'
+
     # In established mode the tuple space is bounded, so after the first pass
     # every packet hits a session that already exists: pps is forwarding rate,
     # and packets-per-session says how much of the run was actually forwarding.
     if [ "$PER_IP" != 0 ]; then
-        awk -v p="$total_sent" -v c="${d[1]}" -v t="$elapsed" 'BEGIN{
-            if (c > 0) printf "     forwarding: %d pps over %d established sessions (%.0f packets each)\n", p/t, c, p/c
+        awk -v p="$delivered" -v c="${d[1]}" -v t="$elapsed" 'BEGIN{
+            if (c > 0) printf "     receiver SNAT: %d pps over %d established sessions (%.0f packets each)\n", p/t, c, p/c
         }'
     fi
 
     LAST_D=("${d[@]}")
-    LAST_CPS=$cps
     return 0
 }
 
@@ -319,7 +333,6 @@ else
     # allocator is supposed to make this impossible, so check it rather than
     # assume it.
     head_ "port allocation invariant"
-    local total dups
     total=$(awk '$1 ~ /^[0-9]+$/ && /->/ {n++} END{print n+0}' /proc/net/CGNAT/sessions 2>/dev/null)
     dups=$(awk '$1 ~ /^[0-9]+$/ && /->/ {print $1, $4}' /proc/net/CGNAT/sessions 2>/dev/null \
            | sort | uniq -d | wc -l)
@@ -360,11 +373,11 @@ else
     head_ "reading it"
     if [ "${LAST_D[3]:-0}" -gt 0 ]; then
         say "  ${C_Y}per-user session limit reached${C_0} (${LAST_D[3]} refusals)."
-        say "  4096 per protocol per user, hardcoded in check_user_limits()."
+        say "  the configured TCP, UDP or shared other-protocol subscriber cap."
     fi
     if [ "${LAST_D[4]:-0}" -gt 0 ]; then
         say "  ${C_Y}NAT ports exhausted${C_0} (${LAST_D[4]} refusals)."
-        say "  search_free_l4_port() walks up to 64512 lookups under the"
+        say "  search_free_l4_port() scans up to an 8 KiB bitmap under the"
         say "  per-address spinlock before giving up - the expensive failure."
     fi
     if [ "${LAST_D[3]:-0}" = 0 ] && [ "${LAST_D[4]:-0}" = 0 ]; then

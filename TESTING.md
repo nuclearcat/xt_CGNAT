@@ -270,3 +270,25 @@ sustains 1.9x the rate by recycling ports immediately.
   Anything smaller than that now hides. For validating a per-session change,
   use a pool large enough not to saturate but a run short enough to keep
   allocator variance down, e.g. `--pool 64 --duration 2`.
+
+## Safety regression coverage
+
+`qemu-tests.sh` invokes `safety-tests.py` only inside its guarded guest workflow.
+It checks namespace rule rejection, valid and invalid CLI/pool input, exclusive
+generic-protocol ownership, parallel quota reservation, a second remote peer
+for an existing full-cone mapping, NetFlow timer/full-batch delivery, and live
+pool reader/rule-registration/deletion races. The suite scans dmesg for KASAN,
+lockdep and atomic-sleep errors afterwards. These stress tests complement, and
+do not prove absence of, every possible concurrency defect.
+
+`python3 -m unittest discover -s ci -p 'test_*.py'` also compiles the actual
+packed session-state helpers with C11 atomics, tests concurrent refresh versus
+expiry and TCP/UDP controls, and evaluates the allocation guard using 32-bit
+size arithmetic. This arithmetic test is not a booted 32-bit kernel test.
+
+The CPS benchmark distinguishes generator-offered packets from UDP packets
+counted at the receiving namespace's IP stack. The receiver intentionally drops
+those datagrams to suppress ICMP feedback. That is not application goodput or a
+checksum-validation test. DNAT/bidirectional and controlled near-full occupancy
+measurements remain separate milestones; historical PPS figures must not be
+presented as current, receiver-verified forwarding capacity.

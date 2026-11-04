@@ -153,6 +153,9 @@ covered by the test suite.
 
 ## Pools
 
+For a short pool syntax reminder and a link back to this guide, run
+`iptables -j CGNAT -h` after installing the userspace extension.
+
 A pool is a contiguous range of public addresses. Its full spec is:
 
 ```
@@ -160,8 +163,9 @@ A pool is a contiguous range of public addresses. Its full spec is:
 ```
 
 - `<name>` is optional and limited to 15 characters. Without one, there is a
-  single pool called `default`. A first field containing `-` is recognised as a
-  range, which is how the old unnamed syntax keeps working.
+  single pool called `default`. Names may contain only letters, digits, underscore
+  and dot. A first field containing `-` is recognised as a range, which
+  is how the old unnamed syntax keeps working.
 - The two bare trailing fields turn on [deterministic
   mapping](#deterministic-mapping-rfc-7422). Both or neither.
 - Any field containing `=` is a [timeout override](#timeouts). These may appear
@@ -323,12 +327,12 @@ All are load-time only unless noted.
 | `timeouts` | none | baseline session timeouts every pool starts from, see [Timeouts](#timeouts) |
 | `nat_hash_size` | 262144 | session hash buckets, 1024..16777216. Two tables of this size. At more sessions than buckets, chains lengthen and every packet walks further — size it to your expected session count |
 | `users_hash_size` | 65536 | subscriber hash buckets, same range |
-| `user_max_sessions` | 4096 | concurrent sessions per subscriber **per protocol**, 1..65535. Writable at runtime |
+| `user_max_sessions` | 4096 | concurrent sessions per subscriber in each of three groups (TCP, UDP, all other protocols), 1..65535. Writable at runtime |
 | `port_quarantine` | 0 | when a NAT port becomes reusable. `0` releases it as soon as the session stops being findable, which maximises capacity but lets a port be reissued while the old session is still in the table. `1` holds it until the session is unlinked, about one GC sweep later — no port is ever mapped to two sessions, at the cost of holding roughly ten seconds of expiring sessions' ports out of service. Writable at runtime; the choice is fixed per session at creation, so a change affects only new sessions |
 | `nf_dest` | none | NetFlow v9 collectors, `addr:port[,addr:port]` |
 
 Note `user_max_sessions` is a cap on top of whatever ports are available, and it
-is **per protocol** — a subscriber can hold 4096 TCP *and* 4096 UDP sessions at
+is **per accounting group** — a subscriber can hold 4096 TCP *and* 4096 UDP sessions at
 the default. It limits one abusive subscriber; it does not protect a pool from
 exhaustion in aggregate. See [Sizing](#sizing).
 
@@ -444,6 +448,12 @@ rest are global:
 
 ## NetFlow v9 export
 
+Socket setup and transmission run in a process-context worker. A bounded queue
+holds up to 64 PDUs; overflow drops a PDU and increments `NetFlow dropped PDUs`
+in `/proc/net/CGNAT/statistics`. Monitor this counter when attribution logging is
+required. Collector delivery remains best-effort UDP.
+
+
 Point the module at one or more collectors:
 
 ```
@@ -492,8 +502,8 @@ dedicated slab cache. One million concurrent sessions is about 64 MB of session
 objects. Port bitmaps are 8 KB per (address, protocol), so 24 KB per public
 address, or ~6 MB for a /24.
 
-**Per-subscriber caps.** `user_max_sessions` bounds one subscriber, per
-protocol. It does not bound the pool: with `N` subscribers sharing an address,
+**Per-subscriber caps.** `user_max_sessions` bounds one subscriber separately
+for TCP, UDP and a shared group for ICMP/other protocols. It does not bound the pool: with `N` subscribers sharing an address,
 `N × 4096` is far above 64512 for any realistic `N`, so the pool exhausts first.
 If you need a hard per-subscriber bound that also bounds the pool, use
 [deterministic mapping](#deterministic-mapping-rfc-7422).
@@ -538,7 +548,7 @@ module needs `x_tables` already loaded. Use `modprobe` after `make install` and
 * Per-pool session timeouts, including a separate short timer for DNS so one
   query and reply does not hold a public port for five minutes
 * Optional deterministic port mapping (RFC 7422) for logless attribution
-* Per-subscriber session quotas, per protocol, adjustable at runtime
+* Per-subscriber session quotas for TCP, UDP and other protocols, adjustable at runtime
 * NAT event export over NetFlow v9
 * Statistics and live session/pool state via /proc
 
@@ -553,9 +563,16 @@ module needs `x_tables` already loaded. Use `modprobe` after `make install` and
 * Disabling hardware offloads (GRO/GSO/TSO) makes real fragments more likely,
   and those are dropped.
 * No ALGs or helpers (FTP, SIP, PPTP, …).
-* For protocols other than TCP/UDP/ICMP the mapping is per subscriber and
-  protocol, with no port, so distinct flows of the same protocol are not
-  separated.
+* Protocols other than TCP/UDP/ICMP reserve one subscriber per public IP and
+  protocol. Competing subscribers are refused until that mapping expires (and
+  its quarantine ends, if enabled). Distinct flows of that protocol are not
+  separated; use dedicated public addresses when concurrent subscribers need it.
+* CGNAT rules are supported only in the initial network namespace. Subscriber
+  and remote peers may live in other namespaces, but cannot install their own
+  CGNAT rules against the host's global state.
+* Inbound TCP FIN/RST does not shorten mapping lifetime: full-cone filtering
+  does not authenticate the sender or validate TCP sequence numbers. Subscriber
+  FIN/RST still uses the configured short close timeout.
 * Timeout granularity is 10 seconds, with arbitrary phase — see
   [Timeouts](#timeouts).
 * At most 8 pools, with names up to 15 characters.
@@ -598,3 +615,8 @@ See [TESTING.md](TESTING.md) for what each mode proves, how to build a suitable
 debug kernel, the benchmark modes, and the current performance baseline.
 [TODO.md](TODO.md) records the ideas that have been thought through but not
 built, including the ones deliberately rejected and why.
+
+## Correctness and performance work
+
+See [MILESTONES.md](MILESTONES.md) for the review findings, remediation status,
+regression criteria and outstanding performance measurements.

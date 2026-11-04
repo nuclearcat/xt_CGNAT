@@ -664,7 +664,7 @@ trap cleanup EXIT INT TERM
 
 step "assembling the guest payload"
 cp "$SRCDIR"/*.c "$SRCDIR"/*.h "$SRCDIR/Makefile" \
-   "$SRCDIR/qemu-tests.sh" "$SRCDIR/testnet.sh" "$SRCDIR/bench-cps.sh" "$RUNDIR/share/src/" \
+   "$SRCDIR/qemu-tests.sh" "$SRCDIR/safety-tests.py" "$SRCDIR/testnet.sh" "$SRCDIR/bench-cps.sh" "$RUNDIR/share/src/" \
     || die "could not copy the source tree"
 
 BUILD_IN_GUEST=1

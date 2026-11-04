@@ -23,8 +23,8 @@
 # less than the same test on one with it.
 #
 # Build the module and libxt_CGNAT.so against the kernel you are going to boot,
-# then run this inside it. Note that it sets the FORWARD policy to ACCEPT and
-# does not put it back.
+# then run this inside it. It installs/removes individual rules and changes
+# forwarding/rp_filter sysctls in the disposable guest.
 #
 # Usage:
 #   ./qemu-tests.sh                 run the standard set
@@ -149,8 +149,9 @@ check_env() {
 }
 
 report_kernel_config() {
-    local cfg=/boot/config-$(uname -r) opt found=() reader=cat
-    if [ -f /proc/config.gz ]; then cfg=/proc/config.gz; reader=zcat; fi
+    local cfg opt found=() reader="cat"
+    cfg=/boot/config-$(uname -r)
+    if [ -f /proc/config.gz ]; then cfg=/proc/config.gz; reader="zcat"; fi
     [ -f "$cfg" ] || { say "${C_Y}note:${C_0} no kernel config found, cannot report debug options"; return; }
     need "$reader" || return
     for opt in KASAN PROVE_LOCKING PROVE_RCU DEBUG_ATOMIC_SLEEP \
@@ -907,6 +908,12 @@ t_tables
 t_icmp_error
 t_icmp_malformed
 t_target_validation
+dmesg_mark
+if XT_NAT_SAFETY_VM=1 python3 "$SRCDIR/safety-tests.py" "$MODULE"; then
+    dmesg_check "safety regressions" && pass "safety regressions"
+else
+    fail "safety regressions"
+fi
 t_named_pools
 t_pool_runtime
 t_timeouts
