@@ -17,8 +17,79 @@ Results land in `vm-results/`: `report.md`, `console.log`, `guest.log`,
 drops straight into CI.
 
 First run downloads an Ubuntu cloud image (~820 MB, cached) and installs a
-toolchain in the guest; it then saves that as `prepared-<release>.qcow2` and
+toolchain in the guest; it then saves that as `prepared-<cache-key>.qcow2` and
 later runs skip both. Cold 112s, warm 33s, and a warm run needs no network.
+
+## Automated kernel coverage
+
+`.github/workflows/testing-kernels.yaml` runs on pull requests, pushes to
+`main`/`master`, every Monday, and manual dispatch. Every matrix entry builds
+the module and userspace extension, boots QEMU, and runs `qemu-tests.sh --soak`.
+CI uses `--strict`, so skipped tests fail the job. A compile alone is not a pass.
+Rule teardown waits up to five seconds for nftables' deferred RCU destruction
+before unloading the target or deleting its pool; a reference leak still fails.
+The port-reuse test gives debug kernels eight seconds to fill the same 60000
+tuples and retains its existing count bounds and five fill/drain cycles.
+
+| Track | Selection | Runtime checks |
+|---|---|---|
+| Upstream stable and LTS | Latest patch of every non-EOL stable/longterm branch in [kernel.org metadata](https://www.kernel.org/releases.json) | Full suite, KASAN, lockdep |
+| Upstream mainline | Latest mainline release or RC from the same metadata | Same; failures block just like stable |
+| Debian 13 | Current `linux-image-amd64` and matching headers | Full suite on the distro kernel |
+| Ubuntu 24.04 GA | Current `linux-generic` | Full suite on the distro kernel |
+| Ubuntu 24.04 HWE | Current `linux-generic-hwe-24.04` | Full suite on the distro kernel |
+| Ubuntu 26.04 GA | Current `linux-generic` | Full suite on the distro kernel |
+| Fedora | Two newest final releases in [Fedora metadata](https://fedoraproject.org/releases.json); current `kernel`, `kernel-devel`, and `kernel-modules-extra` | Full suite on each distro kernel |
+
+The matrix is resolved once per workflow and saved as `resolved-kernel-matrix`.
+Source URLs come from release metadata, including the different tarball location
+for mainline RCs. EOL branches and Fedora betas are excluded. Discovery errors
+fail the workflow instead of falling back to stale versions.
+
+Distro jobs start with fresh official cloud images, install current kernel and
+development packages, shut down, then boot again before building the module.
+The guest checks that `uname -r` matches the installed kernel with headers.
+Ubuntu GA and HWE have separate prepared-image caches. The ext4 payload disk
+avoids depending on the distro kernel providing 9p. No host module is loaded.
+On Fedora, the harness runs as an unconfined systemd service so cloud-init's
+SELinux domain does not prevent module loading or namespace mounts. SELinux
+remains enforcing, and the built module receives its normal `modules_object_t`
+label. The SELinux mode, test-service context, and audit log are recorded.
+
+Each job uploads available artifacts even on failure: its console, test output,
+guest environment (actual kernel, compiler, module vermagic, iptables backend),
+and report.
+Upstream jobs also save `.config` and the kernel build log. The
+`kernel-coverage` job succeeds only when discovery and every matrix job pass;
+it is the stable check name to use in branch protection.
+
+To reproduce distro coverage locally:
+
+```sh
+UBUNTU_RELEASE=24.04 ./run-vm.sh --transport disk \
+  --kernel-packages linux-generic-hwe-24.04 --soak --strict --refresh-image
+./run-vm.sh --transport disk \
+  --image https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2 \
+  --kernel-packages 'linux-image-amd64 linux-headers-amd64' --soak --strict --refresh-image
+python3 ci/kernel-matrix.py  # prints the current upstream and distro selections
+```
+
+`--refresh-image` removes the downloaded base and all prepared tracks backed
+by that image. Omit it for fast repeats on the same installed kernel.
+Disk transport requires `mkfs.ext4` and `debugfs` from e2fsprogs. The timeout
+applies to each of the two boots. CI requires KVM; local runs can use TCG.
+Set `RESULTS_DIR` to keep separate result directories for parallel local runs.
+
+To reproduce an upstream job, unpack its source tarball, run
+`bash ci/build-kernel.sh /path/to/linux`, then
+`UBUNTU_RELEASE=24.04 ./run-vm.sh --kdir /path/to/linux --transport disk --soak --strict`.
+The build helper verifies essential options after `olddefconfig`, including
+KASAN and lockdep, so silently discarded config settings fail the job.
+
+Scope is x86-64, the distro's selected iptables backend, and the functional
+suite implemented in `qemu-tests.sh`. This does not cover every architecture,
+vendor kernel flavor, or both iptables backends on every kernel. Historical
+versions that have reached EOL are not part of the moving upstream matrix.
 
 ## What each mode actually proves
 
@@ -57,6 +128,8 @@ things without which the rig cannot run at all:
   `-j CT --notrack`.
 - `NF_TABLES` + `NFT_COMPAT`. A current distro's iptables is the nft backend and
   reaches xt targets through `nft_compat`; without these `-j CGNAT` cannot load.
+- `NFT_COUNTER` (where still optional) + `NFT_CT`, for iptables-nft counters
+  and its native `CT --notrack` translation on older kernels.
 - `IKCONFIG_PROC`, so the guest can report which debug options it has.
 - 9p, veth, namespaces, virtio.
 
@@ -188,11 +261,9 @@ sustains 1.9x the rate by recycling ports immediately.
   session share one hash lookup path, so the DNAT reply path is inferred rather
   than measured.
 - 4 vCPUs cannot show contention that only appears at 32.
-- `--kdir` has been exercised on 7.0 only.
-- The CI workflow (`testing-kernels.yaml`) covers 7.0 and 6.19 either side of
-  the `sockaddr_unsized` boundary. Its 6.19 leg has been reproduced locally and
-  passes; the other seven legs have not been run, and it is still
-  `workflow_dispatch` only.
+- The automated matrix above defines required coverage. Only a successful run
+  of all its jobs establishes that a particular commit passed it; adding a
+  matrix entry alone is not evidence of kernel compatibility.
 - **The benchmark has outgrown its own resolution.** At ~750k cps it is
   generator-bound and allocates several million sessions a run, and two runs of
   the same build differ by about 9% - against 1.9% at one NAT address earlier.

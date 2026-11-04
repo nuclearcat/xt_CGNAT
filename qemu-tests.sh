@@ -502,6 +502,7 @@ t_pool_runtime() {
         fail "$n" "deleted a pool while a rule still referenced it"; return
     fi
     ipt -D FORWARD -s $SUB_CIDR -o xn-i0 -j CGNAT --snat --pool extra
+    wait_pool_rules_gone extra || { fail "$n" "deleted rule still references pool"; return; }
 
     # now it should go
     if ! echo "del extra" > /proc/net/CGNAT/pools 2>"$TMPD/err"; then
@@ -631,8 +632,9 @@ t_aging_ports() {
     # has nothing to do with when a session in it was created, so a timeout of
     # one step expires anywhere in 0..10s and a burst spends its time recreating
     # sessions it just made. Three steps guarantees at least 20s of life, which
-    # is longer than the burst. .3 is unused, so nothing replies and none of
-    # these ever reach udp_est.
+    # is longer than the 8s burst even under KASAN/lockdep. A 3s burst can end
+    # before a debug kernel has seen all 60000 tuples. .3 is unused, so nothing
+    # replies and none of these ever reach udp_est.
     if ! insmod "$MODULE" nat_pool="p:$POOL_START-$POOL_START:udp=30" 2>"$TMPD/err"; then
         fail "$n" "insmod failed: $(head -1 "$TMPD/err")"
         mod_up 2>/dev/null; rules_up; return
@@ -642,7 +644,7 @@ t_aging_ports() {
     local dmac; dmac=$(ip link show xn-s0 | awk '/link\/ether/{print $2}')
     local cycle peak bad="" i act
     for cycle in 1 2 3 4 5; do
-        ip netns exec $NS_SUB "$gen" xn-s1 "$dmac" "$SUB_NET.10" $ips "$INET_NET.3" 3 $per_ip \
+        ip netns exec $NS_SUB "$gen" xn-s1 "$dmac" "$SUB_NET.10" $ips "$INET_NET.3" 8 $per_ip \
             >/dev/null 2>&1
         sleep 2
         peak=$(nat_stat "Active NAT sessions")

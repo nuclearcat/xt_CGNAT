@@ -108,12 +108,31 @@ rules_up() {
 }
 
 rules_down() {
+    local pool_opt=${POOL_OPT:-}
     ipt -D FORWARD -s $SUB_CIDR -o xn-i0 -j CGNAT --snat ${POOL_OPT:-} 2>/dev/null
     ipt -D FORWARD -i xn-i0 -o xn-s0 -d $SUB_CIDR -j ACCEPT 2>/dev/null
     ipt -t raw -D PREROUTING -d $POOL_NET -j CT --notrack 2>/dev/null
     ipt -t raw -D PREROUTING -s $SUB_CIDR -j CT --notrack 2>/dev/null
     ipt -t raw -D PREROUTING -d $POOL_NET -j CGNAT --dnat ${POOL_OPT:-} 2>/dev/null
-    return 0
+    wait_pool_rules_gone "${pool_opt##* }"
+}
+
+# nftables can acknowledge a rule deletion before the RCU worker calls the
+# target's destructor. In particular on 5.10, immediately deleting its pool or
+# unloading the module can still return EBUSY. Wait for the actual references,
+# with a bound so a leaked reference remains a test failure.
+wait_pool_rules_gone() {
+    local pool=${1:-default} attempt refs
+    for attempt in $(seq 1 50); do
+        refs=$(awk -v pool="$pool" '
+            /^pool / { selected = ($2 == pool) }
+            selected && /rules referencing:/ { print $3; exit }
+        ' /proc/net/CGNAT/pools 2>/dev/null)
+        [ "${refs:-0}" = 0 ] && return 0
+        sleep 0.1
+    done
+    echo "pool $pool still has $refs rule references after deletion" >&2
+    return 1
 }
 
 # insmod loads exactly the file it is given and resolves nothing, so every

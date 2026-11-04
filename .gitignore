@@ -11,3 +11,4 @@ modules.order
 
 # run-vm.sh output
 vm-results/
+__pycache__/

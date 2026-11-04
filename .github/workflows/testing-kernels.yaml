@@ -1,69 +1,129 @@
-# github workflow: build xt_CGNAT against a spread of vanilla kernels
 name: Kernels Build and Test
+
 on:
-# manually triggered workflow
+  pull_request:
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: '23 4 * * 1'
   workflow_dispatch:
 
-#    pull_request:
-#    branches:
-#      - main
+permissions:
+  contents: read
+
+concurrency:
+  group: kernels-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  test-kernels:
-    runs-on: ubuntu-latest
+  matrix:
+    runs-on: ubuntu-24.04
+    outputs:
+      upstream: ${{ steps.resolve.outputs.upstream }}
+      distro: ${{ steps.resolve.outputs.distro }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test CI helpers
+        run: |
+          python3 -m unittest discover -s ci -p 'test_*.py' -v
+          for script in run-vm.sh qemu-tests.sh testnet.sh ci/build-kernel.sh; do
+            bash -n "$script"
+          done
+      - name: Resolve current kernel and distro releases
+        id: resolve
+        run: python3 ci/kernel-matrix.py | tee resolved-matrix.txt >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: resolved-kernel-matrix
+          path: resolved-matrix.txt
+
+  upstream:
+    needs: matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     strategy:
       fail-fast: false
-      matrix:
-        kernel-version: [7.0, 6.19, 6.18, 6.12.58, 6.6.116, 6.1.158, 5.15.196, 5.10.246]
-    name: Test with ${{ matrix.kernel-version }}    
+      matrix: ${{ fromJSON(needs.matrix.outputs.upstream) }}
+    name: Upstream ${{ matrix.channel }} ${{ matrix.version }}
     steps:
-        - name: Checkout repository
-          uses: actions/checkout@v2
-          with:
-            fetch-depth: 0  # Fetch all history for all branches and tags
-            path: xt_CGNAT
-        - name: Install dependencies
-          run: |
-            sudo apt-get update
-            sudo apt-get install -y flex bison libelf-dev bc libxtables-dev pkg-config dkms libxtables-dev pkg-config
-        - name: Download kernel
-          run: |
-            # cdn.kernel.org groups by major: v5.x, v6.x, v7.x
-            MAJOR="${{ matrix.kernel-version }}"
-            KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR%%.*}.x"
-            echo "Downloading kernel from $KERNEL_URL"
-            wget $KERNEL_URL/linux-${{ matrix.kernel-version }}.tar.xz
-        - name: Extract kernel source
-          run: |
-            tar -xf linux-${{ matrix.kernel-version }}.tar.xz
-        - name: Configure and build kernel
-          run: |
-            cd linux-${{ matrix.kernel-version }}
-            make tinyconfig
-            # tinyconfig starts from i386 and allnoconfig clears CONFIG_64BIT,
-            # so the build was 32-bit: CONFIG_X86_64 is *selected by* 64BIT and
-            # enabling it directly does nothing. This module targets x86-64.
-            ./scripts/config --enable CONFIG_64BIT
-            ./scripts/config --enable CONFIG_X86_64
-            ./scripts/config --enable CONFIG_NET
-            ./scripts/config --enable CONFIG_INET
-            ./scripts/config --enable CONFIG_IPV6
-            ./scripts/config --enable CONFIG_NETFILTER
-            ./scripts/config --enable CONFIG_BRIDGE
-            ./scripts/config --enable CONFIG_BRIDGE_NETFILTER
-            ./scripts/config --enable CONFIG_NETFILTER_ADVANCED
-            ./scripts/config --enable CONFIG_NF_CONNTRACK
-            ./scripts/config --enable CONFIG_NF_CONNTRACK_EVENTS
-            ./scripts/config --enable CONFIG_MODULES
-            ./scripts/config --enable CONFIG_SYSCTL
-            ./scripts/config --enable CONFIG_PROC_FS
-            ./scripts/config --enable CONFIG_NF_NAT
-            ./scripts/config --enable CONFIG_IP6_NF_IPTABLES
-            make olddefconfig
-            make -j$(nproc)
-            cd ..
-        - name: Build xt_CGNAT
-          run: |
-            ls -la
-            cd xt_CGNAT
-            make KDIR=../linux-${{ matrix.kernel-version }}
+      - uses: actions/checkout@v4
+      - name: Install build and VM dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc \
+            libxtables-dev pkg-config qemu-system-x86 qemu-utils cloud-image-utils e2fsprogs kmod
+          sudo chmod a+rw /dev/kvm
+      - name: Download and build debug kernel
+        env:
+          KERNEL_URL: ${{ matrix.url }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/linux"
+          curl --fail --location --retry 3 "$KERNEL_URL" -o "$RUNNER_TEMP/linux.tar"
+          tar -xf "$RUNNER_TEMP/linux.tar" --strip-components=1 -C "$RUNNER_TEMP/linux"
+          bash ci/build-kernel.sh "$RUNNER_TEMP/linux" 2>&1 | tee kernel-build.log
+      - name: Boot kernel and run full functional suite
+        env:
+          UBUNTU_RELEASE: '24.04'
+        run: ./run-vm.sh --kdir "$RUNNER_TEMP/linux" --transport disk --soak --strict
+      - name: Collect config and report
+        if: always()
+        run: |
+          cp "$RUNNER_TEMP/linux/.config" kernel.config 2>/dev/null || true
+          if [ -f vm-results/report.md ]; then cat vm-results/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: upstream-${{ matrix.version }}
+          path: |
+            kernel.config
+            kernel-build.log
+            vm-results/
 
+  distro:
+    needs: matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.distro) }}
+    name: Distro ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install VM dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils e2fsprogs
+          sudo chmod a+rw /dev/kvm
+      - name: Install current distro kernel, reboot, build and test
+        env:
+          DISTRO_IMAGE: ${{ matrix.url }}
+          KERNEL_PACKAGES: ${{ matrix.packages }}
+          IMAGE_SHA256: ${{ matrix.sha256 }}
+        run: |
+          ./run-vm.sh --image "$DISTRO_IMAGE" --kernel-packages "$KERNEL_PACKAGES" \
+            --transport disk --soak --strict --refresh-image
+      - name: Publish report
+        if: always()
+        run: |
+          if [ -f vm-results/report.md ]; then cat vm-results/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: distro-${{ matrix.name }}
+          path: vm-results/
+
+  kernel-coverage:
+    # One stable check name for branch protection, including discovery failures.
+    if: always()
+    needs: [matrix, upstream, distro]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every kernel job to pass
+        env:
+          MATRIX_RESULT: ${{ needs.matrix.result }}
+          UPSTREAM_RESULT: ${{ needs.upstream.result }}
+          DISTRO_RESULT: ${{ needs.distro.result }}
+        run: |
+          test "$MATRIX_RESULT" = success
+          test "$UPSTREAM_RESULT" = success
+          test "$DISTRO_RESULT" = success

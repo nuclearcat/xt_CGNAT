@@ -10,6 +10,10 @@
 #   ./run-vm.sh --kdir ~/linux           boot your own kernel - use this one
 #   ./run-vm.sh --soak --keep
 #   ./run-vm.sh --shell                  drop to a guest shell instead
+#   ./run-vm.sh --image URL --kernel-packages "linux-generic" --transport disk
+#                                       update distro kernel, reboot, then test
+#   --transport disk                    use an ext4 payload disk instead of 9p
+#   --strict                            fail if any functional test is skipped
 #
 # What runs in the guest - the two stages are independent toggles:
 #
@@ -49,7 +53,7 @@ set -u
 
 SRCDIR=$(cd "$(dirname "$0")" && pwd)
 CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/xt_CGNAT-vm
-RESULTS=$SRCDIR/vm-results
+RESULTS=${RESULTS_DIR:-$SRCDIR/vm-results}
 RUNDIR=""
 
 # Current LTS. cloud-images.ubuntu.com serves releases under the version number
@@ -71,6 +75,11 @@ ACCEL="unknown"
 BENCH=0
 BENCH_ARGS=
 RUN_TESTS=1
+TRANSPORT=9p
+KERNEL_PACKAGES=""
+STRICT=0
+BOOT=1
+IMAGE_SHA256=${IMAGE_SHA256:-}
 
 if [ -t 1 ]; then
     C_G=$'\033[32m'; C_R=$'\033[31m'; C_Y=$'\033[33m'; C_B=$'\033[1m'; C_0=$'\033[0m'
@@ -111,6 +120,10 @@ CONFIG_PACKET=y
 CONFIG_NF_TABLES=y
 CONFIG_NF_TABLES_INET=y
 CONFIG_NFT_COMPAT=y
+# Older kernels make counters optional; iptables-nft puts one on every rule.
+# Its CT --notrack translation also needs the native nftables CT expressions.
+CONFIG_NFT_COUNTER=y
+CONFIG_NFT_CT=y
 # --- 9p, for getting the sources in and the results out ---
 CONFIG_NET_9P=y
 CONFIG_NET_9P_VIRTIO=y
@@ -121,6 +134,9 @@ CONFIG_VIRTIO_PCI=y
 CONFIG_VIRTIO_BLK=y
 CONFIG_VIRTIO_NET=y
 CONFIG_EXT4_FS=y
+# Populate /dev when directly booting without an initramfs.
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
 CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
 # --- so the guest can report which of these are actually on: a custom kernel
@@ -156,6 +172,9 @@ while [ $# -gt 0 ]; do
         --kernel)  shift; KERNEL=${1:-} ;;
         --rootdev) shift; ROOTDEV=${1:-/dev/vda1} ;;
         --image)   shift; IMAGE_URL=${1:-} ;;
+        --transport) shift; TRANSPORT=${1:-} ;;
+        --kernel-packages) shift; KERNEL_PACKAGES=${1:-} ;;
+        --strict) STRICT=1 ;;
         --cpus)    shift; CPUS=${1:-4} ;;
         --memory)  shift; MEMORY=${1:-4096} ;;
         --timeout) shift; TIMEOUT=${1:-1800} ;;
@@ -176,6 +195,14 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+case "$TRANSPORT" in 9p|disk) ;; *) die "--transport must be 9p or disk" ;; esac
+if [ -n "$KERNEL_PACKAGES" ]; then
+    [[ "$KERNEL_PACKAGES" =~ ^[a-zA-Z0-9.+\ -]+$ ]] || die "invalid kernel package names"
+    [ -z "$KDIR$KERNEL" ] || die "--kernel-packages cannot be combined with a custom kernel"
+    [ "$TRANSPORT" = disk ] || die "--kernel-packages requires --transport disk"
+    [ "$SHELL_MODE" = 0 ] || die "--kernel-packages cannot be combined with --shell"
+fi
+
 if [ "$RUN_TESTS" = 0 ] && [ "$BENCH" = 0 ] && [ "$SHELL_MODE" = 0 ]; then
     die "--no-tests without --bench leaves nothing to run"
 fi
@@ -189,6 +216,10 @@ need() { command -v "$1" >/dev/null 2>&1; }
 
 need qemu-system-x86_64 || die "qemu-system-x86_64 not installed"
 need qemu-img           || die "qemu-img not installed"
+if [ "$TRANSPORT" = disk ]; then
+    need mkfs.ext4 || die "mkfs.ext4 not installed"
+    need debugfs || die "debugfs not installed"
+fi
 
 # a progress bar redrawn with \r is noise in a log file or a CI job
 if [ -t 1 ]; then CURL_P=--progress-bar; WGET_P=--show-progress
@@ -221,12 +252,17 @@ fi
 # ------------------------------------------------------------------- image ---
 
 mkdir -p "$CACHE"
-IMAGE=$CACHE/$(basename "$IMAGE_URL")
+# Separate image URLs and package tracks (e.g. Ubuntu GA/HWE) in the cache.
+IMAGE_KEY=$(printf '%s' "$IMAGE_URL" | sha256sum | cut -c1-16)
+PREPARED_KEY=$(printf '%s\n' "$IMAGE_URL" "$KERNEL_PACKAGES" | sha256sum | cut -c1-16)
+IMAGE=$CACHE/$IMAGE_KEY-$(basename "$IMAGE_URL")
 # base image + the toolchain apt installed on the first run. Saved after a run
 # that got far enough to build, and used as the backing file from then on, so
 # later runs neither install nor download anything.
-PREPARED=$CACHE/prepared-$UBUNTU_RELEASE.qcow2
-[ $REFRESH = 1 ] && rm -f "$PREPARED"
+PREPARED=$CACHE/prepared-$IMAGE_KEY-$PREPARED_KEY.qcow2
+# Every prepared track is an overlay of this base. Replacing the base while
+# retaining another track's overlay (e.g. HWE when refreshing GA) corrupts it.
+[ $REFRESH = 1 ] && rm -f "$CACHE/prepared-$IMAGE_KEY-"*.qcow2 "$IMAGE"
 
 fetch_image() {
     if [ -f "$IMAGE" ]; then
@@ -236,10 +272,17 @@ fetch_image() {
     step "downloading $(basename "$IMAGE_URL") (once, cached in $CACHE)"
     $FETCH "$IMAGE.part" "$IMAGE_URL" || die "download failed"
 
+    if [ -n "$IMAGE_SHA256" ]; then
+        have=$(sha256sum "$IMAGE.part" | cut -d' ' -f1)
+        [ "$IMAGE_SHA256" = "$have" ] || { rm -f "$IMAGE.part"; die "checksum mismatch on downloaded image"; }
+        mv "$IMAGE.part" "$IMAGE"
+        return
+    fi
+
     # verify against the SHA256SUMS next to it, if we can get it
     local sums="${IMAGE_URL%/*}/SHA256SUMS" want have
     if need sha256sum && $FETCH "$CACHE/SHA256SUMS" "$sums" 2>/dev/null; then
-        want=$(grep -F " *$(basename "$IMAGE_URL")" "$CACHE/SHA256SUMS" 2>/dev/null | cut -d' ' -f1)
+        want=$(awk -v file="$(basename "$IMAGE_URL")" '$2 == file || $2 == "*" file {print $1}' "$CACHE/SHA256SUMS")
         if [ -n "$want" ]; then
             have=$(sha256sum "$IMAGE.part" | cut -d' ' -f1)
             [ "$want" = "$have" ] || { rm -f "$IMAGE.part"; die "checksum mismatch on downloaded image"; }
@@ -262,6 +305,19 @@ write_guest_runner() {
 cat >"$RUNDIR/share/guest-run.sh" <<'GUEST'
 #!/bin/bash
 set -u
+# Fedora confines cloud-init. Run this privileged kernel-test harness in a
+# separate unconfined service, keeping SELinux enforcing for the guest.
+if command -v selinuxenabled >/dev/null && selinuxenabled && [ "${XTNAT_SERVICE:-0}" != 1 ]; then
+    systemd-run --quiet --wait --pipe --collect \
+        --property=SELinuxContext=system_u:system_r:unconfined_service_t:s0 \
+        --setenv=XTNAT_SERVICE=1 \
+        --setenv="BUILD_MODULE_IN_GUEST=${BUILD_MODULE_IN_GUEST:-0}" \
+        --setenv="RUN_TESTS=${RUN_TESTS:-1}" --setenv="TEST_ARGS=${TEST_ARGS:-}" \
+        --setenv="RUN_BENCH=${RUN_BENCH:-0}" --setenv="BENCH_ARGS=${BENCH_ARGS:-}" \
+        --setenv="KERNEL_PACKAGES=${KERNEL_PACKAGES:-}" --setenv="STRICT=${STRICT:-0}" \
+        /bin/bash /mnt/xtnat/guest-run.sh
+    exit $?
+fi
 SHARE=/mnt/xtnat
 ART=$SHARE/artifacts
 mkdir -p "$ART"
@@ -273,6 +329,7 @@ echo "### $(head -1 /etc/os-release 2>/dev/null)"
 fatal() { echo "### GUEST FATAL: $*"; echo 90 > "$ART/exit-code"; finish; }
 finish() {
     dmesg > "$ART/dmesg.txt" 2>/dev/null
+    [ -r /var/log/audit/audit.log ] && cp /var/log/audit/audit.log "$ART/audit.log" 2>/dev/null
     [ -r /proc/lock_stat ] && cp /proc/lock_stat "$ART/lock_stat.txt" 2>/dev/null
     sync
     echo "### XTNAT-DONE rc=$(cat "$ART/exit-code" 2>/dev/null || echo 91)"
@@ -280,31 +337,77 @@ finish() {
 }
 
 export DEBIAN_FRONTEND=noninteractive
-PKGS="build-essential pkg-config libxtables-dev iptables tcpdump ethtool python3 kmod"
-[ "${BUILD_MODULE_IN_GUEST:-0}" = 1 ] && PKGS="$PKGS linux-headers-$(uname -r)"
+if command -v apt-get >/dev/null; then
+    PKGS="build-essential pkg-config libxtables-dev iptables iproute2 iputils-ping procps tcpdump ethtool python3 kmod"
+    install_packages() {
+        apt-get update -qq && apt-get install -y -qq "$@"
+    }
+elif command -v dnf >/dev/null; then
+    PKGS="gcc make pkgconf-pkg-config iptables-devel iptables-nft iproute iputils procps-ng tcpdump ethtool python3 kmod"
+    install_packages() { dnf install -y --refresh "$@"; }
+else
+    fatal "unsupported guest package manager"
+fi
+
+# Update the requested distro track before testing. Repositories may no longer
+# carry headers for an old cloud image's kernel (especially Fedora).
+if [ -n "${KERNEL_PACKAGES:-}" ] && [ ! -f /root/xtnat-expected-kernel ]; then
+    # Package lists are intentionally split into arguments.
+    install_packages $PKGS $KERNEL_PACKAGES || fatal "kernel preparation failed"
+    expected=$(find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V | tail -1)
+    [ -n "$expected" ] && [ -d "/lib/modules/$expected/build" ] \
+        || fatal "updated kernel has no matching build tree"
+    echo "$expected" > /root/xtnat-expected-kernel
+    if command -v grubby >/dev/null; then
+        grubby --set-default "/boot/vmlinuz-$expected" || fatal "could not select updated kernel"
+    elif command -v update-grub >/dev/null; then
+        update-grub || fatal "could not update grub"
+    fi
+    echo "### prepared kernel $expected; requesting another boot"
+    touch "$ART/reboot-request"
+    sync
+    exit 0
+fi
+if [ -n "${KERNEL_PACKAGES:-}" ]; then
+    expected=$(cat /root/xtnat-expected-kernel)
+    [ "$(uname -r)" = "$expected" ] || fatal "booted $(uname -r), expected $expected"
+fi
+
+if [ "${BUILD_MODULE_IN_GUEST:-0}" = 1 ]; then
+    if command -v apt-get >/dev/null; then
+        PKGS="$PKGS linux-headers-$(uname -r)"
+    else
+        PKGS="$PKGS kernel-devel-$(uname -r) kernel-modules-extra-$(uname -r)"
+    fi
+fi
 
 # A prepared image already has all of this, and re-running apt is the single
 # largest cost of a run - and the only step that needs the network at all.
 deps_present() {
-    command -v gcc      >/dev/null 2>&1 || return 1
-    command -v python3  >/dev/null 2>&1 || return 1
-    command -v iptables >/dev/null 2>&1 || return 1
+    local tool
+    for tool in gcc make python3 iptables ip ping sysctl tcpdump ethtool modinfo; do
+        command -v "$tool" >/dev/null 2>&1 || return 1
+    done
     pkg-config --exists xtables 2>/dev/null || return 1
     [ "${BUILD_MODULE_IN_GUEST:-0}" != 1 ] || [ -d "/lib/modules/$(uname -r)/build" ] || return 1
     return 0
 }
 
 if deps_present; then
-    echo "### toolchain already present, skipping apt"
+    echo "### toolchain already present, skipping package installation"
 else
     echo "### installing: $PKGS"
-    apt-get update -qq          || echo "### apt update failed, continuing"
-    apt-get install -y -qq $PKGS || fatal "could not install build dependencies"
+    install_packages $PKGS || fatal "could not install build dependencies"
 fi
 
 # 9p is fine for reading, but build somewhere native
 rm -rf /root/src && mkdir -p /root/src
 cp -a "$SHARE"/src/. /root/src/
+if command -v selinuxenabled >/dev/null && selinuxenabled; then
+    # The payload filesystem has no SELinux labels; do not preserve those on
+    # the native build tree. Label the resulting module as a kernel module.
+    restorecon -RF /root/src || fatal "could not label the build tree"
+fi
 cd /root/src || fatal "no source"
 
 if [ "${BUILD_MODULE_IN_GUEST:-0}" = 1 ]; then
@@ -318,6 +421,9 @@ fi
 
 echo "### building libxt_CGNAT.so"
 make libxt_CGNAT.so || fatal "userspace extension build failed"
+if command -v selinuxenabled >/dev/null && selinuxenabled; then
+    chcon -t modules_object_t /root/src/xt_CGNAT.ko || fatal "could not label the kernel module"
+fi
 
 modinfo /root/src/xt_CGNAT.ko | sed -n '1,6p'
 
@@ -327,10 +433,15 @@ modinfo /root/src/xt_CGNAT.ko | sed -n '1,6p'
     echo "vcpus=$(nproc)"
     echo "memory_mb=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 ))"
     echo "gcc=$(gcc --version 2>/dev/null | head -1)"
+    echo "iptables=$(iptables --version)"
+    if command -v selinuxenabled >/dev/null && selinuxenabled; then
+        echo "selinux=$(getenforce)"
+        echo "selinux_context=$(id -Z)"
+    fi
     echo "vermagic=$(modinfo -F vermagic /root/src/xt_CGNAT.ko 2>/dev/null)"
     dbg=""
-    cfg="/boot/config-$(uname -r)"; rd=cat
-    [ -r /proc/config.gz ] && { cfg=/proc/config.gz; rd=zcat; }
+    cfg="/boot/config-$(uname -r)"; rd='cat'
+    [ -r /proc/config.gz ] && { cfg=/proc/config.gz; rd='zcat'; }
     for o in KASAN PROVE_LOCKING PROVE_RCU DEBUG_ATOMIC_SLEEP DEBUG_OBJECTS_TIMERS \
              DEBUG_KMEMLEAK SLUB_DEBUG DEBUG_LIST LOCK_STAT; do
         $rd "$cfg" 2>/dev/null | grep -q "^CONFIG_$o=y" && dbg="$dbg $o"
@@ -346,6 +457,10 @@ if [ "${RUN_TESTS:-1}" = 1 ]; then
     echo "### running qemu-tests.sh ${TEST_ARGS:-}"
     MODULE=/root/src/xt_CGNAT.ko /root/src/qemu-tests.sh ${TEST_ARGS:-} 2>&1 | tee "$ART/tests.txt"
     rc=${PIPESTATUS[0]}
+    if [ "${STRICT:-0}" = 1 ] && grep -q '^SKIP ' "$ART/tests.txt"; then
+        echo "### strict mode: skipped tests are failures"
+        rc=1
+    fi
     echo "### qemu-tests.sh exited $rc"
 fi
 
@@ -367,10 +482,14 @@ chmod +x "$RUNDIR/share/guest-run.sh"
 
 write_cloud_init() {
     local testargs=""
+    local mount_share="mount -t 9p -o trans=virtio,version=9p2000.L,msize=262144 xtnat /mnt/xtnat"
+    if [ "$TRANSPORT" = disk ]; then
+        mount_share="mount -t ext4 /dev/vdc /mnt/xtnat"
+    fi
     [ $SOAK = 1 ] && testargs="--soak"
 
     cat >"$RUNDIR/meta-data" <<EOF
-instance-id: xtnat-$$
+instance-id: xtnat-$(basename "$RUNDIR")-$BOOT
 local-hostname: xtnat-test
 EOF
 
@@ -381,15 +500,15 @@ password: xtnat
 chpasswd: { expire: false }
 ssh_pwauth: true
 runcmd:
-  - [ sh, -c, "mkdir -p /mnt/xtnat && mount -t 9p -o trans=virtio,version=9p2000.L,msize=262144 xtnat /mnt/xtnat" ]
+  - [ sh, -c, "mkdir -p /mnt/xtnat && $mount_share" ]
   - [ sh, -c, "echo '### share mounted at /mnt/xtnat - log in as ubuntu/xtnat' > /dev/console" ]
 EOF
     else
         cat >"$RUNDIR/user-data" <<EOF
 #cloud-config
 runcmd:
-  - [ sh, -c, "mkdir -p /mnt/xtnat && mount -t 9p -o trans=virtio,version=9p2000.L,msize=262144 xtnat /mnt/xtnat || echo '### 9p mount FAILED' > /dev/console" ]
-  - [ sh, -c, "BUILD_MODULE_IN_GUEST=$BUILD_IN_GUEST RUN_TESTS=$RUN_TESTS TEST_ARGS='$testargs' RUN_BENCH=$BENCH BENCH_ARGS='$BENCH_ARGS' bash /mnt/xtnat/guest-run.sh > /dev/console 2>&1" ]
+  - [ sh, -c, "mkdir -p /mnt/xtnat && $mount_share || echo '### payload mount FAILED' > /dev/console" ]
+  - [ sh, -c, "BUILD_MODULE_IN_GUEST=$BUILD_IN_GUEST RUN_TESTS=$RUN_TESTS TEST_ARGS='$testargs' RUN_BENCH=$BENCH BENCH_ARGS='$BENCH_ARGS' KERNEL_PACKAGES='$KERNEL_PACKAGES' STRICT=$STRICT bash /mnt/xtnat/guest-run.sh > /dev/console 2>&1" ]
 power_state:
   mode: poweroff
   timeout: 60
@@ -579,9 +698,18 @@ QEMU=(qemu-system-x86_64
       -m "$MEMORY" -smp "$CPUS"
       -drive "file=$RUNDIR/disk.qcow2,if=virtio,format=qcow2"
       -drive "file=$RUNDIR/seed.iso,if=virtio,format=raw,readonly=on"
-      -virtfs "local,path=$RUNDIR/share,mount_tag=xtnat,security_model=none,id=xtnat"
-      -nic user,model=virtio-net-pci
+      -nic "user,model=virtio-net-pci"
       -nographic -no-reboot)
+
+if [ "$TRANSPORT" = disk ]; then
+    truncate -s 256M "$RUNDIR/payload.img"
+    # Avoid new ext4 features unsupported by older LTS kernels.
+    mkfs.ext4 -q -F -O ^orphan_file,^metadata_csum_seed -d "$RUNDIR/share" "$RUNDIR/payload.img" \
+        || die "could not create payload disk"
+    QEMU+=(-drive "file=$RUNDIR/payload.img,if=virtio,format=raw")
+else
+    QEMU+=(-virtfs "local,path=$RUNDIR/share,mount_tag=xtnat,security_model=none,id=xtnat")
+fi
 
 if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
     QEMU+=(-enable-kvm -cpu host)
@@ -619,14 +747,31 @@ fi
 
 step "booting (timeout ${TIMEOUT}s; console -> $CONSOLE)"
 say "    Ctrl-A X to abort"
-timeout --foreground "$TIMEOUT" "${QEMU[@]}" 2>&1 | tee "$CONSOLE"
-qemu_rc=${PIPESTATUS[0]}
+GUEST_ARTIFACTS=$RUNDIR/share/artifacts
+while :; do
+    timeout --foreground "$TIMEOUT" "${QEMU[@]}" 2>&1 | tee -a "$CONSOLE"
+    qemu_rc=${PIPESTATUS[0]}
+    if [ "$TRANSPORT" = disk ]; then
+        # rdump refuses to replace an existing directory, including after the
+        # preparation boot. Always extract into a fresh destination.
+        mkdir -p "$RUNDIR/collected-$BOOT"
+        debugfs -R "rdump /artifacts $RUNDIR/collected-$BOOT" "$RUNDIR/payload.img" >/dev/null 2>&1
+        GUEST_ARTIFACTS=$RUNDIR/collected-$BOOT/artifacts
+    fi
+    [ "$qemu_rc" = 0 ] || break
+    [ -f "$GUEST_ARTIFACTS/reboot-request" ] || break
+    [ "$BOOT" = 1 ] || die "guest requested more than one kernel preparation reboot"
+    debugfs -w -R 'rm /artifacts/reboot-request' "$RUNDIR/payload.img" >/dev/null 2>&1
+    BOOT=2
+    write_cloud_init
+    step "rebooting into the updated distro kernel"
+done
 
 # ---- collect
 
 step "collecting results"
-for f in guest.log dmesg.txt lock_stat.txt exit-code env.txt tests.txt bench.txt; do
-    [ -f "$RUNDIR/share/artifacts/$f" ] && cp "$RUNDIR/share/artifacts/$f" "$RESULTS/"
+for f in guest.log audit.log dmesg.txt lock_stat.txt exit-code env.txt tests.txt bench.txt; do
+    [ -f "$GUEST_ARTIFACTS/$f" ] && cp "$GUEST_ARTIFACTS/$f" "$RESULTS/"
 done
 
 rc=""
@@ -643,6 +788,7 @@ if [ -z "$rc" ]; then
     tail -30 "$CONSOLE" | sed 's/^/    | /'
     exit 1
 fi
+[ "$qemu_rc" = 0 ] || rc=1
 
 # env.txt only exists if the guest installed its dependencies and built the
 # module, so it is the signal that this disk is worth keeping.
