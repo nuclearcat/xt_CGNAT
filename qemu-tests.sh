@@ -187,7 +187,8 @@ cat >"$TMPD/udp_srv.py" <<'EOF'
 import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(('0.0.0.0', 7777))
-s.settimeout(15)
+# The safety suite can leave this server idle for more than 15 seconds on a
+# debug kernel. srv_stop owns its lifetime, including that idle period.
 while True:
     d, a = s.recvfrom(2048)
     s.sendto(a[0].encode(), a)          # tell the client which source we saw
@@ -211,7 +212,6 @@ s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('0.0.0.0', 7778))
 s.listen(8)
-s.settimeout(15)
 while True:
     c, a = s.accept()
     c.recv(4096)
@@ -604,6 +604,29 @@ t_timeouts() {
     dmesg_check "$n" && pass "$n"
 }
 
+# Drive the bounded tuple space until it is full, or the fill budget runs out.
+# Keep generator errors distinct from a healthy generator that cannot fill it.
+fill_sessions() {
+    local want=$1 pid attempt active rc stopped=0
+    shift
+    "$@" >"$TMPD/fill.log" 2>&1 &
+    pid=$!
+    for attempt in $(seq 1 30); do
+        sleep 1
+        active=$(nat_stat "Active NAT sessions")
+        [ "${active:-0}" -ge "$want" ] && break
+        kill -0 "$pid" 2>/dev/null || break
+    done
+    if kill "$pid" 2>/dev/null; then stopped=1; fi
+    wait "$pid"; rc=$?
+    info "fill: ${active:-0} of $want sessions after ${attempt}s"
+    if [ "$rc" != 0 ] && ! { [ "$stopped" = 1 ] && [ "$rc" = 143 ]; }; then
+        info "generator exited $rc: $(cat "$TMPD/fill.log")"
+        return 1
+    fi
+    return 0
+}
+
 t_aging_ports() {
     # The GC releases a session's port in a window one sweep wide and unlinks it
     # in the next. That window used to be an exact "timeout == 0" test, which
@@ -629,14 +652,14 @@ t_aging_ports() {
         mod_up; rules_up; return
     fi
 
-    # udp=30 rather than the minimum: the GC visits a bucket on a schedule that
+    # udp=60 rather than the minimum: the GC visits a bucket on a schedule that
     # has nothing to do with when a session in it was created, so a timeout of
     # one step expires anywhere in 0..10s and a burst spends its time recreating
-    # sessions it just made. Three steps guarantees at least 20s of life, which
-    # is longer than the 8s burst even under KASAN/lockdep. A 3s burst can end
-    # before a debug kernel has seen all 60000 tuples. .3 is unused, so nothing
-    # replies and none of these ever reach udp_est.
-    if ! insmod "$MODULE" nat_pool="p:$POOL_START-$POOL_START:udp=30" 2>"$TMPD/err"; then
+    # sessions it just made. Six steps guarantees at least 50s of life, longer
+    # than the bounded 30s fill plus the 2s settling delay. A fixed 8s burst
+    # reached only ~30000 tuples on CI's slower debug kernels. .3 is unused,
+    # so nothing replies and none of these ever reach udp_est.
+    if ! insmod "$MODULE" nat_pool="p:$POOL_START-$POOL_START:udp=60" 2>"$TMPD/err"; then
         fail "$n" "insmod failed: $(head -1 "$TMPD/err")"
         mod_up 2>/dev/null; rules_up; return
     fi
@@ -645,13 +668,14 @@ t_aging_ports() {
     local dmac; dmac=$(ip link show xn-s0 | awk '/link\/ether/{print $2}')
     local cycle peak bad="" i act
     for cycle in 1 2 3 4 5; do
-        ip netns exec $NS_SUB "$gen" xn-s1 "$dmac" "$SUB_NET.10" $ips "$INET_NET.3" 8 $per_ip \
-            >/dev/null 2>&1
+        fill_sessions "$want" ip netns exec $NS_SUB "$gen" xn-s1 "$dmac" \
+            "$SUB_NET.10" $ips "$INET_NET.3" 30 $per_ip \
+            || bad="$bad cycle$cycle generator failed;"
         sleep 2
         peak=$(nat_stat "Active NAT sessions")
         info "cycle $cycle: $peak of $want sessions (created $(nat_stat "Created NAT sessions"), raced $(nat_stat "Raced session creates"), noport $(nat_stat "Failed sessions no free port"), ulimit $(nat_stat "Failed sessions user limit"))"
-        # Bounded on both sides. Low means ports did not come back; high means
-        # sessions were created for a tuple that already had one, which is what
+        # Bounded on both sides. Low means generation or allocation failed;
+        # high means sessions were created for a tuple that already had one, as
         # happens when a session ages out from under a burst that is still
         # sending to it. 2% either way for packets the virtio path drops.
         [ "${peak:-0}" -ge $(( want * 98 / 100 )) ] \
