@@ -28,8 +28,12 @@ the module and userspace extension, boots QEMU, and runs `qemu-tests.sh --soak`.
 CI uses `--strict`, so skipped tests fail the job. A compile alone is not a pass.
 Rule teardown waits up to five seconds for nftables' deferred RCU destruction
 before unloading the target or deleting its pool; a reference leak still fails.
-The port-reuse test gives debug kernels eight seconds to fill the same 60000
-tuples and retains its existing count bounds and five fill/drain cycles.
+The echo servers stay alive until suite teardown, including idle time during
+the safety regressions. The port-reuse test fills the same 60000 tuples until
+the table reaches that count or a 30-second budget expires. Its 60-second UDP
+timeout keeps sessions alive throughout the fill and settling delay. The count
+bounds and five fill/drain cycles remain unchanged; generator failures are
+reported separately from a table that does not fill.
 
 | Track | Selection | Runtime checks |
 |---|---|---|
