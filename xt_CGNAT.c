@@ -1419,9 +1419,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 return NF_DROP;
             }
             ip = (struct iphdr *)skb_network_header(skb);
-            skb_set_transport_header(skb, ip->ihl * 4);
-            tcp = (struct tcphdr *)skb_transport_header(skb);
-            skb_reset_transport_header(skb);
+            tcp = (struct tcphdr *)((char *)ip + ip->ihl * 4);
 
             rcu_read_lock_bh();
             session = lookup_session_in(ip->protocol, ip->saddr, tcp->source);
@@ -1464,10 +1462,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 return NF_DROP;
             }
             ip = (struct iphdr *)skb_network_header(skb);
-
-            skb_set_transport_header(skb, ip->ihl * 4);
-            udp = (struct udphdr *)skb_transport_header(skb);
-            skb_reset_transport_header(skb);
+            udp = (struct udphdr *)((char *)ip + ip->ihl * 4);
 
             rcu_read_lock_bh();
             session = lookup_session_in(ip->protocol, ip->saddr, udp->source);
@@ -1510,10 +1505,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 return NF_DROP;
             }
             ip = (struct iphdr *)skb_network_header(skb);
-
-            skb_set_transport_header(skb, ip->ihl * 4);
-            icmp = (struct icmphdr *)skb_transport_header(skb);
-            skb_reset_transport_header(skb);
+            icmp = (struct icmphdr *)((char *)ip + ip->ihl * 4);
 
             nat_port = 0;
             if (icmp->type == 0 || icmp->type == 8) {
@@ -1592,14 +1584,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 return NF_DROP;
             }
             ip = (struct iphdr *)skb_network_header(skb);
-            skb_set_transport_header(skb, ip->ihl * 4);
-            tcp = (struct tcphdr *)skb_transport_header(skb);
-            skb_reset_transport_header(skb);
+            tcp = (struct tcphdr *)((char *)ip + ip->ihl * 4);
 
             rcu_read_lock_bh();
             session = lookup_session_out(ip->protocol, ip->daddr, tcp->dest);
             if (likely(session)) {
-		skb_reset_transport_header(skb);
                 csum_replace4(&ip->check, ip->daddr, session->in_addr);
                 inet_proto_csum_replace4(&tcp->check, skb, ip->daddr, session->in_addr, true);
                 inet_proto_csum_replace2(&tcp->check, skb, tcp->dest, session->in_port, false);
@@ -1626,14 +1615,11 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 return NF_DROP;
             }
             ip = (struct iphdr *)skb_network_header(skb);
-
-            skb_set_transport_header(skb, ip->ihl * 4);
-            udp = (struct udphdr *)skb_transport_header(skb);
+            udp = (struct udphdr *)((char *)ip + ip->ihl * 4);
 
             rcu_read_lock_bh();
             session = lookup_session_out(ip->protocol, ip->daddr, udp->dest);
             if (likely(session)) {
-		skb_reset_transport_header(skb);
                 csum_replace4(&ip->check, ip->daddr, session->in_addr);
                 if (udp->check) {
                     inet_proto_csum_replace4(&udp->check, skb, ip->daddr, session->in_addr, true);
@@ -1661,9 +1647,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 return NF_DROP;
             }
             ip = (struct iphdr *)skb_network_header(skb);
-
-            skb_set_transport_header(skb, ip->ihl * 4);
-            icmp = (struct icmphdr *)skb_transport_header(skb);
+            icmp = (struct icmphdr *)((char *)ip + ip->ihl * 4);
 
             nat_port = 0;
             if (icmp->type == 0 || icmp->type == 8) {
@@ -1680,9 +1664,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     return NF_DROP;
                 }
 
-                skb_set_network_header(skb,sizeof(struct icmphdr) + sizeof(struct iphdr));
-                ip = (struct iphdr *)skb_network_header(skb);
-                skb_reset_network_header(skb);
+                ip = (struct iphdr *)(skb_network_header(skb) + sizeof(struct iphdr) + sizeof(struct icmphdr));
 
                 /* The quoted header carries its own length, and the transport
                  * header below is located with ip->ihl * 4 - but the length
@@ -1709,14 +1691,10 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     return NF_DROP;
                 }
                 /* the pull above may have moved the data */
-                skb_set_network_header(skb,sizeof(struct icmphdr) + sizeof(struct iphdr));
-                ip = (struct iphdr *)skb_network_header(skb);
-                skb_reset_network_header(skb);
+                ip = (struct iphdr *)(skb_network_header(skb) + sizeof(struct iphdr) + sizeof(struct icmphdr));
 
                 if (ip->protocol == IPPROTO_TCP) {
-                    skb_set_transport_header(skb, sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen);
-                    tcp = (struct tcphdr *)skb_transport_header(skb);
-                    skb_reset_transport_header(skb);
+                    tcp = (struct tcphdr *)((char *)ip + inner_hlen);
                     rcu_read_lock_bh();
                     session = lookup_session_out(ip->protocol, ip->saddr, tcp->source);
                     if (session) {
@@ -1733,9 +1711,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     ip->daddr = session->in_addr;
                     rcu_read_unlock_bh();
                 } else if (ip->protocol == IPPROTO_UDP) {
-                    skb_set_transport_header(skb, sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen);
-                    udp = (struct udphdr *)skb_transport_header(skb);
-                    skb_reset_transport_header(skb);
+                    udp = (struct udphdr *)((char *)ip + inner_hlen);
                     rcu_read_lock_bh();
                     session = lookup_session_out(ip->protocol, ip->saddr, udp->source);
                     if (session) {
@@ -1752,9 +1728,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     ip->daddr = session->in_addr;
                     rcu_read_unlock_bh();
                 } else if (ip->protocol == IPPROTO_ICMP) {
-                    skb_set_transport_header(skb, sizeof(struct iphdr) + sizeof(struct icmphdr) + inner_hlen);
-                    icmp = (struct icmphdr *)skb_transport_header(skb);
-                    skb_reset_transport_header(skb);
+                    icmp = (struct icmphdr *)((char *)ip + inner_hlen);
 
                     nat_port = 0;
                     if (icmp->type == 0 || icmp->type == 8) {
