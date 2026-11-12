@@ -1507,21 +1507,19 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             ip = (struct iphdr *)skb_network_header(skb);
             icmp = (struct icmphdr *)((char *)ip + ip->ihl * 4);
 
-            nat_port = 0;
-            if (icmp->type == 0 || icmp->type == 8) {
-                nat_port = icmp->un.echo.id;
+            if (unlikely(icmp->type != ICMP_ECHO && icmp->type != ICMP_ECHOREPLY)) {
+                atomic64_inc(&pkt_drop_proto);
+                return NF_DROP;
             }
+            nat_port = icmp->un.echo.id;
 
             rcu_read_lock_bh();
             session = lookup_session_in(ip->protocol, ip->saddr, nat_port);
             if (session) {
                 csum_replace4(&ip->check, ip->saddr, session->nat_addr);
                 ip->saddr = session->nat_addr;
-
-                if (icmp->type == 0 || icmp->type == 8) {
-                    inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->out_port, false);
-                    icmp->un.echo.id = session->out_port;
-                }
+                inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->out_port, false);
+                icmp->un.echo.id = session->out_port;
                 if (!session_touch(session, false, false)) {
                     rcu_read_unlock_bh();
                     return NF_DROP;
@@ -1536,10 +1534,8 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 }
                 csum_replace4(&ip->check, ip->saddr, session->nat_addr);
                 ip->saddr = session->nat_addr;
-                if (icmp->type == 0 || icmp->type == 8) {
-                    inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->out_port, false);
-                    icmp->un.echo.id = session->out_port;
-                }
+                inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->out_port, false);
+                icmp->un.echo.id = session->out_port;
                 rcu_read_unlock_bh();
             }
         } else {
@@ -1740,22 +1736,19 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 } else if (ip->protocol == IPPROTO_ICMP) {
                     icmp = (struct icmphdr *)((char *)ip + inner_hlen);
 
-                    nat_port = 0;
-                    if (icmp->type == 0 || icmp->type == 8) {
-                        nat_port = icmp->un.echo.id;
+                    if (unlikely(icmp->type != ICMP_ECHO && icmp->type != ICMP_ECHOREPLY)) {
+                        NAT_STAT_INC(dnat_dropped);
+                        return NF_DROP;
                     }
+                    nat_port = icmp->un.echo.id;
 
                     rcu_read_lock_bh();
                     session = lookup_session_out(ip->protocol, ip->saddr, nat_port);
                     if (session) {
                         csum_replace4(&ip->check, ip->saddr, session->in_addr);
                         ip->saddr = session->in_addr;
-
-                        if (icmp->type == 0 || icmp->type == 8) {
-                            csum_replace2(&icmp->checksum, nat_port, session->in_port);
-                            icmp->un.echo.id = session->in_port;
-                        }
-
+                        csum_replace2(&icmp->checksum, nat_port, session->in_port);
+                        icmp->un.echo.id = session->in_port;
                     } else {
                         rcu_read_unlock_bh();
                         NAT_STAT_INC(dnat_dropped);
@@ -1797,16 +1790,17 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 if (skb->ip_summed == CHECKSUM_COMPLETE)
                     skb->ip_summed = CHECKSUM_NONE;
                 return NF_ACCEPT;
+            } else {
+                NAT_STAT_INC(dnat_dropped);
+                return NF_DROP;
             }
             rcu_read_lock_bh();
             session = lookup_session_out(ip->protocol, ip->daddr, nat_port);
             if (likely(session)) {
                 csum_replace4(&ip->check, ip->daddr, session->in_addr);
                 ip->daddr = session->in_addr;
-                if (icmp->type == 0 || icmp->type == 8) {
-                    inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->in_port, false);
-                    icmp->un.echo.id = session->in_port;
-                }
+                inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->in_port, false);
+                icmp->un.echo.id = session->in_port;
                 if (!session_touch(session, true, false)) {
                     rcu_read_unlock_bh();
                     return NF_DROP;
