@@ -1471,6 +1471,8 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 if (udp->check) {
                     inet_proto_csum_replace4(&udp->check, skb, ip->saddr, session->nat_addr, true);
                     inet_proto_csum_replace2(&udp->check, skb, udp->source, session->out_port, false);
+                    if (!udp->check)
+                        udp->check = CSUM_MANGLED_0;
                 }
                 ip->saddr = session->nat_addr;
                 udp->source = session->out_port;
@@ -1490,6 +1492,8 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 if (udp->check) {
                     inet_proto_csum_replace4(&udp->check, skb, ip->saddr, session->nat_addr, true);
                     inet_proto_csum_replace2(&udp->check, skb, session->in_port, session->out_port, false);
+                    if (!udp->check)
+                        udp->check = CSUM_MANGLED_0;
                 }
                 ip->saddr = session->nat_addr;
                 udp->source = session->out_port;
@@ -1621,6 +1625,8 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 if (udp->check) {
                     inet_proto_csum_replace4(&udp->check, skb, ip->daddr, session->in_addr, true);
                     inet_proto_csum_replace2(&udp->check, skb, udp->dest, session->in_port, false);
+                    if (!udp->check)
+                        udp->check = CSUM_MANGLED_0;
                 }
                 ip->daddr = session->in_addr;
                 udp->dest = session->in_port;
