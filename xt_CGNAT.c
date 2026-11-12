@@ -1602,6 +1602,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             } else {
                 rcu_read_unlock_bh();
                 NAT_STAT_INC(dnat_dropped);
+                return NF_DROP;
             }
         } else if (ip->protocol == IPPROTO_UDP) {
             if (unlikely(skb->len < ip_hdrlen(skb) + sizeof(struct udphdr))) {
@@ -1636,6 +1637,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             } else {
                 rcu_read_unlock_bh();
                 NAT_STAT_INC(dnat_dropped);
+                return NF_DROP;
             }
         } else if (ip->protocol == IPPROTO_ICMP) {
             if (unlikely(skb->len < ip_hdrlen(skb) + sizeof(struct icmphdr))) {
@@ -1704,7 +1706,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     } else {
                         rcu_read_unlock_bh();
                         NAT_STAT_INC(dnat_dropped);
-                        return NF_ACCEPT;
+                        return NF_DROP;
                     }
 
                     ip = (struct iphdr *)skb_network_header(skb);
@@ -1728,7 +1730,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     } else {
                         rcu_read_unlock_bh();
                         NAT_STAT_INC(dnat_dropped);
-                        return NF_ACCEPT;
+                        return NF_DROP;
                     }
                     ip = (struct iphdr *)skb_network_header(skb);
 
@@ -1757,7 +1759,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     } else {
                         rcu_read_unlock_bh();
                         NAT_STAT_INC(dnat_dropped);
-                        return NF_ACCEPT;
+                        return NF_DROP;
                     }
                     ip = (struct iphdr *)skb_network_header(skb);
                     csum_replace4(&ip->check, ip->daddr, session->in_addr);
@@ -1772,7 +1774,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     } else {
                         rcu_read_unlock_bh();
                         NAT_STAT_INC(dnat_dropped);
-                        return NF_ACCEPT;
+                        return NF_DROP;
                     }
                     ip = (struct iphdr *)skb_network_header(skb);
                     csum_replace4(&ip->check, ip->daddr, session->in_addr);
@@ -1813,6 +1815,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             } else {
                 rcu_read_unlock_bh();
                 NAT_STAT_INC(dnat_dropped);
+                return NF_DROP;
             }
         } else {
             if (unlikely(compat_skb_ensure_writable(skb, ip_hdrlen(skb)))) {
@@ -1835,6 +1838,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             } else {
                 rcu_read_unlock_bh();
                 NAT_STAT_INC(dnat_dropped);
+                return NF_DROP;
             }
         }
     }

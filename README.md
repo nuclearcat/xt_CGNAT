@@ -440,7 +440,7 @@ rest are global:
 
 | counter | meaning |
 |---|---|
-| `DNAT dropped pkts` | inbound packets to a pool address with no matching session. **The packet is passed through untranslated**, not dropped by the target — it is normally discarded later by routing or a firewall rule. Expect a steady trickle from internet background noise |
+| `DNAT dropped pkts` | inbound packets to a pool address with no matching session, dropped by the target. Expect a steady trickle from internet background noise |
 | `Fragmented pkts` | first fragments seen, which are translated normally. Non-first fragments are counted under `Dropped ip fragment` |
 | `Related ICMP pkts` | ICMP errors quoting a translated packet, rewritten inside the quoted header |
 | `Failed sessions *` | why session creation was refused — see [Troubleshooting](#troubleshooting) |
