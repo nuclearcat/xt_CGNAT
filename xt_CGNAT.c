@@ -1703,6 +1703,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                         tcp->source = session->in_port;
                     } else {
                         rcu_read_unlock_bh();
+                        NAT_STAT_INC(dnat_dropped);
                         return NF_ACCEPT;
                     }
 
@@ -1715,11 +1716,18 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                     rcu_read_lock_bh();
                     session = lookup_session_out(ip->protocol, ip->saddr, udp->source);
                     if (session) {
+                        if (udp->check) {
+                            csum_replace4(&udp->check, ip->saddr, session->in_addr);
+                            csum_replace2(&udp->check, udp->source, session->in_port);
+                            if (!udp->check)
+                                udp->check = CSUM_MANGLED_0;
+                        }
                         csum_replace4(&ip->check, ip->saddr, session->in_addr);
                         ip->saddr = session->in_addr;
                         udp->source = session->in_port;
                     } else {
                         rcu_read_unlock_bh();
+                        NAT_STAT_INC(dnat_dropped);
                         return NF_ACCEPT;
                     }
                     ip = (struct iphdr *)skb_network_header(skb);
@@ -1742,12 +1750,28 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                         ip->saddr = session->in_addr;
 
                         if (icmp->type == 0 || icmp->type == 8) {
-                            inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->in_port, false);
+                            csum_replace2(&icmp->checksum, nat_port, session->in_port);
                             icmp->un.echo.id = session->in_port;
                         }
 
                     } else {
                         rcu_read_unlock_bh();
+                        NAT_STAT_INC(dnat_dropped);
+                        return NF_ACCEPT;
+                    }
+                    ip = (struct iphdr *)skb_network_header(skb);
+                    csum_replace4(&ip->check, ip->daddr, session->in_addr);
+                    ip->daddr = session->in_addr;
+                    rcu_read_unlock_bh();
+                } else {
+                    rcu_read_lock_bh();
+                    session = lookup_session_out(ip->protocol, ip->saddr, 0);
+                    if (session) {
+                        csum_replace4(&ip->check, ip->saddr, session->in_addr);
+                        ip->saddr = session->in_addr;
+                    } else {
+                        rcu_read_unlock_bh();
+                        NAT_STAT_INC(dnat_dropped);
                         return NF_ACCEPT;
                     }
                     ip = (struct iphdr *)skb_network_header(skb);
