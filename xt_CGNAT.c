@@ -1861,14 +1861,11 @@ static void users_cleanup_timer_callback( struct timer_list *timer )
         return;
     }
 
-    vector_start = users_htable_vector * (users_hash_size/60);
-    if (users_htable_vector == 60) {
-        vector_end = users_hash_size;
+    vector_start = ((u64)users_htable_vector * users_hash_size) / 60;
+    users_htable_vector++;
+    vector_end = ((u64)users_htable_vector * users_hash_size) / 60;
+    if (users_htable_vector >= 60)
         users_htable_vector = 0;
-    } else {
-        vector_end = vector_start + (users_hash_size/60);
-        users_htable_vector++;
-    }
 
     for (i = vector_start; i < vector_end; i++) {
         spin_lock_bh(&ht_users[i].lock);
@@ -1911,14 +1908,11 @@ static void sessions_cleanup_timer_callback( struct timer_list *timer )
         return;
     }
 
-    vector_start = nat_htable_vector * (nat_hash_size/100);
-    if (nat_htable_vector == 100) {
-        vector_end = nat_hash_size;
+    vector_start = ((u64)nat_htable_vector * nat_hash_size) / 100;
+    nat_htable_vector++;
+    vector_end = ((u64)nat_htable_vector * nat_hash_size) / 100;
+    if (nat_htable_vector >= 100)
         nat_htable_vector = 0;
-    } else {
-        vector_end = vector_start + (nat_hash_size/100);
-        nat_htable_vector++;
-    }
 
     /* One pass over ht_inner. The session is a single object in both chains,
      * so it is unlinked from both here and freed once. The outer table no
