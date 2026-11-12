@@ -1428,7 +1428,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
             if (session) {
                 csum_replace4(&ip->check, ip->saddr, session->nat_addr);
                 inet_proto_csum_replace4(&tcp->check, skb, ip->saddr, session->nat_addr, true);
-                inet_proto_csum_replace2(&tcp->check, skb, tcp->source, session->out_port, true);
+                inet_proto_csum_replace2(&tcp->check, skb, tcp->source, session->out_port, false);
 
                 ip->saddr = session->nat_addr;
                 tcp->source = session->out_port;
@@ -1448,7 +1448,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
                 csum_replace4(&ip->check, ip->saddr, session->nat_addr);
                 inet_proto_csum_replace4(&tcp->check, skb, ip->saddr, session->nat_addr, true);
-                inet_proto_csum_replace2(&tcp->check, skb, session->in_port, session->out_port, true);
+                inet_proto_csum_replace2(&tcp->check, skb, session->in_port, session->out_port, false);
                 ip->saddr = session->nat_addr;
                 tcp->source = session->out_port;
                 rcu_read_unlock_bh();
@@ -1475,7 +1475,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 csum_replace4(&ip->check, ip->saddr, session->nat_addr);
                 if (udp->check) {
                     inet_proto_csum_replace4(&udp->check, skb, ip->saddr, session->nat_addr, true);
-                    inet_proto_csum_replace2(&udp->check, skb, udp->source, session->out_port, true);
+                    inet_proto_csum_replace2(&udp->check, skb, udp->source, session->out_port, false);
                 }
                 ip->saddr = session->nat_addr;
                 udp->source = session->out_port;
@@ -1494,7 +1494,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 csum_replace4(&ip->check, ip->saddr, session->nat_addr);
                 if (udp->check) {
                     inet_proto_csum_replace4(&udp->check, skb, ip->saddr, session->nat_addr, true);
-                    inet_proto_csum_replace2(&udp->check, skb, session->in_port, session->out_port, true);
+                    inet_proto_csum_replace2(&udp->check, skb, session->in_port, session->out_port, false);
                 }
                 ip->saddr = session->nat_addr;
                 udp->source = session->out_port;
@@ -1527,7 +1527,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 ip->saddr = session->nat_addr;
 
                 if (icmp->type == 0 || icmp->type == 8) {
-                    inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->out_port, true);
+                    inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->out_port, false);
                     icmp->un.echo.id = session->out_port;
                 }
                 if (!session_touch(session, false, false)) {
@@ -1545,7 +1545,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 csum_replace4(&ip->check, ip->saddr, session->nat_addr);
                 ip->saddr = session->nat_addr;
                 if (icmp->type == 0 || icmp->type == 8) {
-                    inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->out_port, true);
+                    inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->out_port, false);
                     icmp->un.echo.id = session->out_port;
                 }
                 rcu_read_unlock_bh();
@@ -1602,7 +1602,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 		skb_reset_transport_header(skb);
                 csum_replace4(&ip->check, ip->daddr, session->in_addr);
                 inet_proto_csum_replace4(&tcp->check, skb, ip->daddr, session->in_addr, true);
-                inet_proto_csum_replace2(&tcp->check, skb, tcp->dest, session->in_port, true);
+                inet_proto_csum_replace2(&tcp->check, skb, tcp->dest, session->in_port, false);
                 ip->daddr = session->in_addr;
                 tcp->dest = session->in_port;
                 if (!session_touch(session, true, tcp->fin || tcp->rst)) {
@@ -1637,7 +1637,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 csum_replace4(&ip->check, ip->daddr, session->in_addr);
                 if (udp->check) {
                     inet_proto_csum_replace4(&udp->check, skb, ip->daddr, session->in_addr, true);
-                    inet_proto_csum_replace2(&udp->check, skb, udp->dest, session->in_port, true);
+                    inet_proto_csum_replace2(&udp->check, skb, udp->dest, session->in_port, false);
                 }
                 ip->daddr = session->in_addr;
                 udp->dest = session->in_port;
@@ -1768,7 +1768,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                         ip->saddr = session->in_addr;
 
                         if (icmp->type == 0 || icmp->type == 8) {
-                            inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->in_port, true);
+                            inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->in_port, false);
                             icmp->un.echo.id = session->in_port;
                         }
 
@@ -1804,7 +1804,7 @@ nat_tg(struct sk_buff *skb, const struct xt_action_param *par)
                 csum_replace4(&ip->check, ip->daddr, session->in_addr);
                 ip->daddr = session->in_addr;
                 if (icmp->type == 0 || icmp->type == 8) {
-                    inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->in_port, true);
+                    inet_proto_csum_replace2(&icmp->checksum, skb, nat_port, session->in_port, false);
                     icmp->un.echo.id = session->in_port;
                 }
                 if (!session_touch(session, true, false)) {
