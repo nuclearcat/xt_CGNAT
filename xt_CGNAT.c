@@ -995,7 +995,7 @@ static int update_user_limits(const u_int8_t proto, const u_int32_t addr, const 
     head = &ht_users[hash].user;
     is_found=0;
     hlist_for_each_entry(user, head, list_node) {
-        if (user->addr == addr && user->idle < 15) {
+        if (user->addr == addr) {
             is_found=1;
             break;
         }
@@ -1876,7 +1876,7 @@ static void users_cleanup_timer_callback( struct timer_list *timer )
                 if (user->tcp_count == 0 && user->udp_count == 0 && user->other_count == 0) {
                     user->idle++;
                 }
-                if (user->idle > 15) {
+                if (user->idle >= 15) {
                     hlist_del_rcu(&user->list_node);
                     ht_users[i].use--;
                     kfree_rcu(user, rcu);
