@@ -2252,7 +2252,8 @@ static int add_nf_destinations(const char *ptr)
         struct sockaddr_storage ss;
         struct netflow_sock *usock;
         struct sockaddr_in *sin;
-        const char *end;
+        const char *end, *colon;
+        u16 port = 2055;
         int succ = 0;
 
         /* skip initial separators */
@@ -2264,17 +2265,32 @@ static int add_nf_destinations(const char *ptr)
         memset(&ss, 0, sizeof(ss));
 
         sin = (struct sockaddr_in *)&ss;
-
         sin->sin_family = AF_INET;
-        sin->sin_port = htons(2055);
-        succ = in4_pton(ptr, len, (u8 *)&sin->sin_addr, -1, &end);
-        if (succ && *end == ':')
-            sin->sin_port = htons(simple_strtoul(++end, NULL, 0));
+
+        colon = memchr(ptr, ':', len);
+        if (colon) {
+            char pbuf[8];
+            size_t plen = (ptr + len) - (colon + 1);
+
+            if (colon > ptr && plen > 0 && plen < sizeof(pbuf) &&
+                in4_pton(ptr, colon - ptr, (u8 *)&sin->sin_addr, -1, &end) &&
+                end == colon) {
+                memcpy(pbuf, colon + 1, plen);
+                pbuf[plen] = '\0';
+                if (!kstrtou16(pbuf, 10, &port) && port > 0)
+                    succ = 1;
+            }
+        } else {
+            if (in4_pton(ptr, len, (u8 *)&sin->sin_addr, -1, &end) &&
+                end == ptr + len)
+                succ = 1;
+        }
+        sin->sin_port = htons(port);
 
         if (!succ) {
             printk(KERN_ERR "xt_CGNAT: can't parse netflow destination: %.*s\n",
                    len, ptr);
-            continue;
+            return -EINVAL;
         }
 
         if (!(usock = vmalloc(sizeof(*usock)))) {
